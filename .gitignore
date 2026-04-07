@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Dataset / data
+real_dataset_and_label/
+synthetic_datasets/
+data/
+dataset/
+datasets/
+*.csv
+*.txt
+*.zip
+*.rar
+*.7z
+*.dat
+*.npy
+*.npz
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Build
+build/
+dist/
+*.egg-info/
