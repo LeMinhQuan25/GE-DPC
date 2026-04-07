@@ -448,8 +448,10 @@ if __name__ == '__main__':
     # feature_file = '/Users/minhquan/Documents/Master/Thesis/Code/GE-DPC-main/dataset/unlabel/dry_bean.txt'
     # label_file = '/Users/minhquan/Documents/Master/Thesis/Code/GE-DPC-main/dataset/label/dry_bean_label.txt'
     BASE_DIR = Path(__file__).resolve().parent
-    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
-    label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
+    feature_file = BASE_DIR / "dataset" / "unlabel" / "breast_cancer.txt"
+    label_file = BASE_DIR / "dataset" / "label" / "breast_cancer_label.txt"
 
     # =========================
     # Algorithm settings
