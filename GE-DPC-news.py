@@ -486,8 +486,12 @@ if __name__ == '__main__':
     # Change only these 2 paths
     # -------------------------
     BASE_DIR = Path(__file__).resolve().parent
-    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
-    label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'census_kdd.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'census_kdd_label.txt'
+    feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
+    label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
     # feature_file = '/Users/quanle/Documents/Master/Thesis/Code/GE-DPC-main/dataset/unlabel/rice+cammeo.txt'
     # label_file = '/Users/quanle/Documents/Master/Thesis/Code/GE-DPC-main/dataset/label/rice+cammeo_label.txt'
 
@@ -495,13 +499,13 @@ if __name__ == '__main__':
     # Core parameters
     # -------------------------
     epsilon = 1e-6
-    outlier_t = 1.7          # paper default / recommended threshold
+    outlier_t = 2.0        # paper default / recommended threshold
 
     # Center selection
     auto_center_mode = 'knee'
-    auto_center_k = 7
-    min_centers = 7
-    max_centers = 7
+    auto_center_k = 3
+    min_centers = 3
+    max_centers = 3
 
     # High-dimensional acceleration knobs
     approx_rank = 16         # try 8, 16, 24, 32
