@@ -274,8 +274,10 @@ if __name__ == "__main__":
     # feature_file = '/Users/quanle/Documents/Master/Thesis/Code/GE-DPC-main/dataset/unlabel/hcv_data.txt'
     # label_file = '/Users/quanle/Documents/Master/Thesis/Code/GE-DPC-main/dataset/label/hcv_data_label.txt'
     BASE_DIR = Path(__file__).resolve().parent
-    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
-    label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
+    feature_file = '/Users/minhquan/Documents/Master/Thesis/Code/GE-DPC-main/real_dataset_and_label/real_datasets/msplice_2.txt'
+    label_file = '/Users/minhquan/Documents/Master/Thesis/Code/GE-DPC-main/real_dataset_and_label/real_datasets_label/msplice_2_label.txt'
     data = np.loadtxt(feature_file)
     # true_labels = np.loadtxt(label_file, dtype=int)
     true_labels = np.loadtxt(label_file, dtype=float).astype(int)
