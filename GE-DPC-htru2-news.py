@@ -6,19 +6,8 @@ from sklearn.metrics import accuracy_score, normalized_mutual_info_score, adjust
 from sklearn.utils.extmath import randomized_svd
 
 
-# ============================================================
-# GE-DPC for high-dimensional data
-# Flexible center-selection version
-# Main idea:
-# 1) Replace exact covariance inverse with low-rank approximate shape model
-# 2) Use randomized SVD on centered data inside each ellipsoid
-# 3) Use Woodbury identity for fast Mahalanobis distance and pair distance
-# 4) Keep center-selection parameters flexible per dataset without duplicated logic
-# ============================================================
-
-
 class FastEllipsoid:
-    def __init__(self, data, indices, epsilon=1e-6, approx_rank=16, oversamples=8, n_iter=2):
+    def __init__(self, data, indices, epsilon=1e-6, approx_rank=8, oversamples=4, n_iter=1):
         self.data = np.asarray(data, dtype=float)
         self.indices = np.asarray(indices, dtype=int)
         self.epsilon = float(epsilon)
@@ -72,7 +61,6 @@ class FastEllipsoid:
         self.cov_eigs = cov_eigs[keep]
         self.rank = len(self.cov_eigs)
         self._inv_diag = 1.0 / (self.cov_eigs + self.epsilon)
-
         self._H_eigs = np.concatenate([
             self.cov_eigs + self.epsilon,
             np.full(max(0, d - self.rank), self.epsilon, dtype=float)
@@ -104,7 +92,6 @@ class FastEllipsoid:
     def compute_major_axis_endpoints(self):
         if self.n_samples <= 1:
             return self.center, self.center
-
         center_distances = np.linalg.norm(self.data - self.center, axis=1)
         point1 = self.data[np.argmin(center_distances)]
         point2 = self.data[np.argmax(np.linalg.norm(self.data - point1, axis=1))]
@@ -177,7 +164,6 @@ def recursive_split_outlier_detection(initial_ellipsoids, data, t=2.0, max_itera
     for _ in range(max_iterations):
         if not ellipsoid_list:
             break
-
         axes_sums = np.array([np.sum(ell.lengths) for ell in ellipsoid_list], dtype=float)
         axes_sum_avg = float(np.mean(axes_sums)) if len(axes_sums) > 0 else 0.0
         outliers = [ell for ell in ellipsoid_list if np.sum(ell.lengths) > 2.0 * axes_sum_avg]
@@ -313,6 +299,38 @@ def auto_select_centers(densities, min_dists, mode='knee', top_k=None, min_cente
     return order[:min(k, n)].tolist()
 
 
+def auto_select_two_peaks_left_right(densities, min_dists):
+    densities = np.asarray(densities, dtype=float)
+    min_dists = np.asarray(min_dists, dtype=float)
+    n = len(densities)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    gamma = densities * min_dists
+    density_median = float(np.median(densities))
+
+    left_candidates = np.where(densities <= density_median)[0]
+    right_candidates = np.where(densities > density_median)[0]
+
+    if len(left_candidates) == 0 or len(right_candidates) == 0:
+        return np.argsort(-gamma)[:2].tolist()
+
+    left_score = min_dists[left_candidates] * (1.0 + 0.05 * densities[left_candidates])
+    right_score = min_dists[right_candidates] * (1.0 + 0.05 * densities[right_candidates])
+
+    left_center = int(left_candidates[np.argmax(left_score)])
+    right_center = int(right_candidates[np.argmax(right_score)])
+
+    if left_center == right_center:
+        return np.argsort(-gamma)[:2].tolist()
+
+    selected = [left_center, right_center]
+    selected = sorted(selected, key=lambda i: gamma[i], reverse=True)
+    return selected
+
+
 def ellipse_cluster(densities, centers, nearest):
     labels = -np.ones(len(densities), dtype=int)
     for i, c in enumerate(centers):
@@ -343,27 +361,22 @@ def align_labels(true_labels, pred_labels):
     return np.array([mapping.get(label, -1) for label in pred_labels])
 
 
-def describe_center_strategy(auto_center_mode, auto_center_k, min_centers, max_centers):
-    if auto_center_k is not None:
-        return f"fixed top-k mode: top_k={auto_center_k} (min/max ignored)"
-    return f"auto mode: mode={auto_center_mode}, min_centers={min_centers}, max_centers={max_centers}"
-
-
-def run_ge_dpc_highdim_fast(
+def run_ge_dpc_highdim_fast_htru2(
     feature_file,
     label_file,
     epsilon=1e-6,
     outlier_t=2.0,
     auto_center_mode='knee',
-    auto_center_k=None,
-    min_centers=1,
-    max_centers=None,
-    approx_rank=16,
-    svd_oversamples=8,
-    svd_n_iter=2,
+    auto_center_k=2,
+    min_centers=2,
+    max_centers=2,
+    approx_rank=8,
+    svd_oversamples=4,
+    svd_n_iter=1,
 ):
     data = np.loadtxt(feature_file, dtype=float)
     true_labels = np.loadtxt(label_file, dtype=float).astype(int)
+    dataset_name = Path(feature_file).stem.lower()
 
     ellipsoid_kwargs = dict(
         epsilon=epsilon,
@@ -390,7 +403,6 @@ def run_ge_dpc_highdim_fast(
             break
 
     print(f"Total ellipsoid count after safe splitting (Tổng số ellipsoid sau phân tách an toàn): {len(ellipsoid_list)}")
-
     ellipsoid_list = recursive_split_outlier_detection(
         ellipsoid_list,
         data,
@@ -416,20 +428,24 @@ def run_ge_dpc_highdim_fast(
     time_attr = t_attr_end - t_attr_start
 
     print("Auto-selecting cluster centers from decision values (Tự động chọn tâm cụm từ các giá trị decision)...")
-    print("Center strategy:", describe_center_strategy(auto_center_mode, auto_center_k, min_centers, max_centers))
-
-    selected = auto_select_centers(
-        densities,
-        min_dists,
-        mode=auto_center_mode,
-        top_k=auto_center_k,
-        min_centers=min_centers,
-        max_centers=max_centers,
-    )
+    if dataset_name == 'htru2':
+        selected = auto_select_two_peaks_left_right(densities, min_dists)
+        print("Selection rule: htru2 special mode -> two peaks left/right (Chế độ riêng htru2 -> 2 peak trái/phải)")
+    else:
+        selected = auto_select_centers(
+            densities,
+            min_dists,
+            mode=auto_center_mode,
+            top_k=auto_center_k,
+            min_centers=min_centers,
+            max_centers=max_centers,
+        )
+        print(f"Selection rule: default auto mode = {auto_center_mode}")
 
     gamma = densities * min_dists
     print(f"Selected cluster centers (Các tâm cụm đã chọn): {selected}")
     print(f"Selected gamma values (Giá trị gamma của các tâm cụm): {[float(gamma[i]) for i in selected]}")
+    print(f"Selected (density, min_dist): {[(float(densities[i]), float(min_dists[i])) for i in selected]}")
 
     t_cluster_start = time.time()
     ge_labels = ellipse_cluster(densities, selected, nearest)
@@ -483,27 +499,24 @@ def run_ge_dpc_highdim_fast(
 
 if __name__ == '__main__':
     BASE_DIR = Path(__file__).resolve().parent
-    # feature_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone.txt'
-    # label_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone_label.txt'
-    feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
-    label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
+    feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'htru2.txt'
+    label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'htru2_label.txt'
 
     epsilon = 1e-6
     outlier_t = 2.0
 
-    # Rule:
-    # - If auto_center_k is not None: exact top-k is used, min/max are ignored.
-    # - If auto_center_k is None: mode + min/max are used.
+    # htru2-tuned center selection
     auto_center_mode = 'knee'
-    auto_center_k = 3
-    min_centers = 1
-    max_centers = None
+    auto_center_k = 2
+    min_centers = 2
+    max_centers = 2
 
-    approx_rank = 16
-    svd_oversamples = 8
-    svd_n_iter = 2
+    # htru2 has only 8 dimensions, so keep rank full-ish to preserve geometry.
+    approx_rank = 8
+    svd_oversamples = 4
+    svd_n_iter = 1
 
-    run_ge_dpc_highdim_fast(
+    run_ge_dpc_highdim_fast_htru2(
         feature_file=feature_file,
         label_file=label_file,
         epsilon=epsilon,

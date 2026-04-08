@@ -8,12 +8,12 @@ from sklearn.utils.extmath import randomized_svd
 
 # ============================================================
 # GE-DPC for high-dimensional data
-# Flexible center-selection version
 # Main idea:
 # 1) Replace exact covariance inverse with low-rank approximate shape model
 # 2) Use randomized SVD on centered data inside each ellipsoid
 # 3) Use Woodbury identity for fast Mahalanobis distance and pair distance
-# 4) Keep center-selection parameters flexible per dataset without duplicated logic
+# This keeps the GE-DPC spirit: covariance-aware ellipsoids + Mahalanobis-based splitting/DPC
+# while reducing the main O(d^3) bottleneck in high dimensions.
 # ============================================================
 
 
@@ -52,6 +52,8 @@ class FastEllipsoid:
         if max_rank <= 0:
             max_rank = 1
 
+        # randomized SVD on centered samples matrix Xc (n x d)
+        # singular values s -> covariance eigenvalues = s^2 / n
         try:
             _, s, Vt = randomized_svd(
                 Xc,
@@ -62,6 +64,7 @@ class FastEllipsoid:
             )
             U_feat = Vt.T
         except Exception:
+            # fallback to exact SVD on small blocks
             _, s, Vt = np.linalg.svd(Xc, full_matrices=False)
             s = s[:max_rank]
             U_feat = Vt[:max_rank].T
@@ -73,6 +76,7 @@ class FastEllipsoid:
         self.rank = len(self.cov_eigs)
         self._inv_diag = 1.0 / (self.cov_eigs + self.epsilon)
 
+        # approximate spectrum of H = S + eps I
         self._H_eigs = np.concatenate([
             self.cov_eigs + self.epsilon,
             np.full(max(0, d - self.rank), self.epsilon, dtype=float)
@@ -86,7 +90,7 @@ class FastEllipsoid:
         if self.rank == 0:
             return np.sum(X * X, axis=1) / self.epsilon
 
-        proj = X @ self.U
+        proj = X @ self.U                                # (m, r)
         parallel_sq = np.sum((proj ** 2) * self._inv_diag[None, :], axis=1)
         total_sq = np.sum(X * X, axis=1)
         proj_sq = np.sum(proj * proj, axis=1)
@@ -99,12 +103,14 @@ class FastEllipsoid:
         return float(np.sqrt(np.max(mahal_sq)))
 
     def _compute_lengths(self):
+        # semi-axis lengths = rho * sqrt(eig(H))
         return self.rho * np.sqrt(np.maximum(self._H_eigs, 1e-18))
 
     def compute_major_axis_endpoints(self):
         if self.n_samples <= 1:
             return self.center, self.center
 
+        # same spirit as original code: approximate farthest-point pair
         center_distances = np.linalg.norm(self.data - self.center, axis=1)
         point1 = self.data[np.argmin(center_distances)]
         point2 = self.data[np.argmax(np.linalg.norm(self.data - point1, axis=1))]
@@ -157,6 +163,7 @@ def splits_ellipsoid(ellipsoid, ellipsoid_kwargs):
     ell1 = FastEllipsoid(c1, i1, **ellipsoid_kwargs)
     ell2 = FastEllipsoid(c2, i2, **ellipsoid_kwargs)
 
+    # Mahalanobis refinement step from the paper, but accelerated
     dist1_sq = ell1.mahal_sq_points(data)
     dist2_sq = ell2.mahal_sq_points(data)
     mask1 = dist1_sq < dist2_sq
@@ -172,7 +179,7 @@ def splits_ellipsoid(ellipsoid, ellipsoid_kwargs):
     return [ell1, ell2]
 
 
-def recursive_split_outlier_detection(initial_ellipsoids, data, t=2.0, max_iterations=10, ellipsoid_kwargs=None):
+def recursive_split_outlier_detection(initial_ellipsoids, data, t=1.7, max_iterations=10, ellipsoid_kwargs=None):
     ellipsoid_list = initial_ellipsoids.copy()
     for _ in range(max_iterations):
         if not ellipsoid_list:
@@ -209,6 +216,9 @@ def recursive_split_outlier_detection(initial_ellipsoids, data, t=2.0, max_itera
 
 
 def _pair_distance_fast(ell_i, ell_j):
+    # H_i ≈ eps I + U_i diag(s_i) U_i^T
+    # H_j ≈ eps I + U_j diag(s_j) U_j^T
+    # H_avg ≈ eps I + A A^T, where A concatenates both factors with sqrt(1/2) scaling.
     diff = ell_i.center - ell_j.center
     eps = max(ell_i.epsilon, ell_j.epsilon)
 
@@ -221,8 +231,8 @@ def _pair_distance_fast(ell_i, ell_j):
     if not mats:
         return float(np.linalg.norm(diff) / np.sqrt(eps))
 
-    A = np.concatenate(mats, axis=1)
-    At_diff = A.T @ diff
+    A = np.concatenate(mats, axis=1)  # (d, k)
+    At_diff = A.T @ diff               # (k,)
     M = np.eye(A.shape[1]) + (A.T @ A) / eps
     try:
         z = np.linalg.solve(M, At_diff)
@@ -342,18 +352,11 @@ def align_labels(true_labels, pred_labels):
     mapping = {pred_classes[j]: true_classes[i] for i, j in zip(row_ind, col_ind)}
     return np.array([mapping.get(label, -1) for label in pred_labels])
 
-
-def describe_center_strategy(auto_center_mode, auto_center_k, min_centers, max_centers):
-    if auto_center_k is not None:
-        return f"fixed top-k mode: top_k={auto_center_k} (min/max ignored)"
-    return f"auto mode: mode={auto_center_mode}, min_centers={min_centers}, max_centers={max_centers}"
-
-
 def run_ge_dpc_highdim_fast(
     feature_file,
     label_file,
     epsilon=1e-6,
-    outlier_t=2.0,
+    outlier_t=1.7,
     auto_center_mode='knee',
     auto_center_k=None,
     min_centers=1,
@@ -416,8 +419,6 @@ def run_ge_dpc_highdim_fast(
     time_attr = t_attr_end - t_attr_start
 
     print("Auto-selecting cluster centers from decision values (Tự động chọn tâm cụm từ các giá trị decision)...")
-    print("Center strategy:", describe_center_strategy(auto_center_mode, auto_center_k, min_centers, max_centers))
-
     selected = auto_select_centers(
         densities,
         min_dists,
@@ -480,30 +481,36 @@ def run_ge_dpc_highdim_fast(
         'total_valid_time_program': total_valid_time2,
     }
 
-
 if __name__ == '__main__':
+    # -------------------------
+    # Change only these 2 paths
+    # -------------------------
     BASE_DIR = Path(__file__).resolve().parent
-    # feature_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone.txt'
-    # label_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone_label.txt'
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'htru2.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'htru2_label.txt'
-    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'breast_cancer.txt'
-    label_file = BASE_DIR / 'dataset' / 'label' / 'breast_cancer_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'census_kdd.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'census_kdd_label.txt'
+    feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
+    label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
+    # feature_file = '/Users/quanle/Documents/Master/Thesis/Code/GE-DPC-main/dataset/unlabel/rice+cammeo.txt'
+    # label_file = '/Users/quanle/Documents/Master/Thesis/Code/GE-DPC-main/dataset/label/rice+cammeo_label.txt'
 
+    # -------------------------
+    # Core parameters
+    # -------------------------
     epsilon = 1e-6
-    outlier_t = 2.0
+    outlier_t = 2.0        # paper default / recommended threshold
 
-    # Rule:
-    # - If auto_center_k is not None: exact top-k is used, min/max are ignored.
-    # - If auto_center_k is None: mode + min/max are used.
+    # Center selection
     auto_center_mode = 'knee'
     auto_center_k = 3
     min_centers = 3
     max_centers = 3
 
-    approx_rank = 30
-    svd_oversamples = 16
-    svd_n_iter = 6
+    # High-dimensional acceleration knobs
+    approx_rank = 16         # try 8, 16, 24, 32
+    svd_oversamples = 8
+    svd_n_iter = 2
 
     run_ge_dpc_highdim_fast(
         feature_file=feature_file,
