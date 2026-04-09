@@ -487,8 +487,10 @@ if __name__ == '__main__':
     # label_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone_label.txt'
     # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'htru2.txt'
     # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'htru2_label.txt'
-    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'breast_cancer.txt'
-    label_file = BASE_DIR / 'dataset' / 'label' / 'breast_cancer_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
+    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
+    label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
 
     epsilon = 1e-6
     outlier_t = 2.0
@@ -497,13 +499,13 @@ if __name__ == '__main__':
     # - If auto_center_k is not None: exact top-k is used, min/max are ignored.
     # - If auto_center_k is None: mode + min/max are used.
     auto_center_mode = 'knee'
-    auto_center_k = 3
-    min_centers = 3
-    max_centers = 3
+    auto_center_k = 2
+    min_centers = 2
+    max_centers = 2
 
-    approx_rank = 30
-    svd_oversamples = 16
-    svd_n_iter = 6
+    approx_rank = 20
+    svd_oversamples = 12
+    svd_n_iter = 4
 
     run_ge_dpc_highdim_fast(
         feature_file=feature_file,

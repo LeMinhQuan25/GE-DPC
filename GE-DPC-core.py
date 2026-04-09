@@ -462,12 +462,14 @@ if __name__ == '__main__':
     # label_file = BASE_DIR / 'data' / 'homology' / 'kddcup04_bio_label.txt'
     # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'htru2.txt'
     # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'htru2_label.txt'
-    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'breast_cancer.txt'
-    label_file = BASE_DIR / 'dataset' / 'label' / 'breast_cancer_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'breast_cancer.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'breast_cancer_label.txt'
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'hcv_data.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'hcv_data_label.txt'
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
+    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
+    label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
 
     # =========================
     # Algorithm settings
@@ -479,9 +481,9 @@ if __name__ == '__main__':
     # min_centers = 1
     # max_centers = None
     auto_center_mode = 'knee'
-    auto_center_k = 3
-    min_centers = 3
-    max_centers = 3
+    auto_center_k = 2
+    min_centers = 2
+    max_centers = 2
 
     run_ge_dpc(
         feature_file=feature_file,
