@@ -443,33 +443,34 @@ if __name__ == '__main__':
     # Local run settings
     # Chỉ cần sửa 2 đường dẫn này khi đổi dataset
     # =========================
-    # feature_file = '/Users/minhquan/Documents/Master/Thesis/Code/GE-DPC-main/real_dataset_and_label/real_datasets/msplice_2.txt'
-    # label_file = '/Users/minhquan/Documents/Master/Thesis/Code/GE-DPC-main/real_dataset_and_label/real_datasets_label/msplice_2_label.txt'
-    # feature_file = '/Users/minhquan/Documents/Master/Thesis/Code/GE-DPC-main/dataset/unlabel/dry_bean.txt'
-    # label_file = '/Users/minhquan/Documents/Master/Thesis/Code/GE-DPC-main/dataset/label/dry_bean_label.txt'
     BASE_DIR = Path(__file__).resolve().parent
-    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
-    # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
-    # feature_file = BASE_DIR / "dataset" / "unlabel" / "breast_cancer.txt"
-    # label_file = BASE_DIR / "dataset" / "label" / "breast_cancer_label.txt"
-    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'census_kdd.txt'
-    # label_file = BASE_DIR / 'dataset' / 'label' / 'census_kdd_label.txt'
-    # feature_file = BASE_DIR / 'data' / 'covtype.txt'
-    # label_file = BASE_DIR / 'data' / 'covtype_label.txt'
+
     # feature_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone.txt'
     # label_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone_label.txt'
-    # feature_file = BASE_DIR / 'data' / 'homology' / 'kddcup04_biotxt'
-    # label_file = BASE_DIR / 'data' / 'homology' / 'kddcup04_bio_label.txt'
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'htru2.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'htru2_label.txt'
+
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Seed.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Seed_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'segment_3.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'segment_3_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'landsat_2.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'landsat_2_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'msplice_2.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'msplice_2_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'rice.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'rice_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'banknote.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'banknote_label.txt'
+    
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'breast_cancer.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'breast_cancer_label.txt'
-    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'hcv_data.txt'
-    # label_file = BASE_DIR / 'dataset' / 'label' / 'hcv_data_label.txt'
+    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'hcv_data.txt'
+    label_file = BASE_DIR / 'dataset' / 'label' / 'hcv_data_label.txt'
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
-    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
-    label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
 
     # =========================
     # Algorithm settings
@@ -481,9 +482,9 @@ if __name__ == '__main__':
     # min_centers = 1
     # max_centers = None
     auto_center_mode = 'knee'
-    auto_center_k = 2
-    min_centers = 2
-    max_centers = 2
+    auto_center_k = 8
+    min_centers = 8
+    max_centers = 8
 
     run_ge_dpc(
         feature_file=feature_file,
