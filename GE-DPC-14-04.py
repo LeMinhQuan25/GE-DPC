@@ -1,5 +1,6 @@
 import time
 from pathlib import Path
+
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import accuracy_score, normalized_mutual_info_score, adjusted_rand_score
@@ -8,21 +9,39 @@ from sklearn.utils.extmath import randomized_svd
 
 # ============================================================
 # GE-DPC for high-dimensional data
-# Reduced-parameter version
+# Improved version:
+# - still follows approximate matrix computation / randomized SVD
+# - fixes the main quality-loss issues of the previous version
 #
-# Main ideas:
-# 1) approx_rank is NOT manually tuned anymore
-# 2) approx_rank is automatically inferred from data dimension:
-#       rank = min(d, n_samples, max(6, ceil(2 * sqrt(d))))
-# 3) randomized SVD internal parameters are fixed:
-#       n_oversamples = 8
-#       n_iter = 2
-# 4) hybrid strategy:
-#       - low dimensional data  -> full SVD
-#       - higher dimensional    -> randomized SVD
+# Main fixes:
+# 1) Optional Min-Max normalization [0,1] inside pipeline
+# 2) No more harsh perpendicular penalty with 1/epsilon
+# 3) Rank is selected by explained variance, not fixed 2*sqrt(d)
+# 4) Randomized SVD only when data is truly large / high-dimensional
+# 5) Residual orthogonal variance is preserved to avoid shape distortion
 # ============================================================
 
 
+# =========================
+# Utility: normalization
+# =========================
+def minmax_normalize(X, eps=1e-12):
+    X = np.asarray(X, dtype=float)
+    col_min = np.min(X, axis=0)
+    col_max = np.max(X, axis=0)
+    col_range = col_max - col_min
+
+    constant_mask = col_range < eps
+    safe_range = np.where(constant_mask, 1.0, col_range)
+
+    X_norm = (X - col_min) / safe_range
+    X_norm[:, constant_mask] = 0.0
+    return X_norm
+
+
+# =========================
+# Improved ellipsoid
+# =========================
 class FastEllipsoid:
     def __init__(self, data, indices, epsilon=1e-6):
         self.data = np.asarray(data, dtype=float)
@@ -35,94 +54,157 @@ class FastEllipsoid:
         self.n_samples, self.dim = self.data.shape
         self.center = np.mean(self.data, axis=0)
 
-        # Internal fixed technical constants
+        # Internal fixed constants
+        self._energy_threshold = 0.99
+        self._min_rank = 2
+        self._max_rank_cap = 64
+
+        # Hybrid rule for switching to randomized SVD
+        self._rand_dim_threshold = 32
+        self._rand_sample_threshold = 256
+
         self._svd_oversamples = 8
         self._svd_n_iter = 2
 
-        # Hybrid threshold:
-        # d <= 20: use full SVD (exact enough and usually not expensive)
-        # d > 20 : use randomized SVD
-        self._approx_dim_threshold = 20
-
-        self._fit_low_rank_shape()
+        self._fit_shape()
         self.rho = self._compute_rho()
         self.lengths = self._compute_lengths()
         self.major_axis_endpoints = self.compute_major_axis_endpoints()
 
-    def _auto_rank(self):
-        """
-        Automatically infer low-rank dimension from data dimension d.
-        rank = min(d, n_samples, max(6, ceil(2 * sqrt(d))))
-        """
-        d = self.dim
-        n = self.n_samples
-        rank_target = max(6, int(np.ceil(2.0 * np.sqrt(d))))
-        return int(min(d, n, rank_target))
+    def _should_use_randomized_svd(self, Xc, probe_rank):
+        n, d = Xc.shape
+        min_nd = min(n, d)
+        if d < self._rand_dim_threshold:
+            return False
+        if n < self._rand_sample_threshold:
+            return False
+        if probe_rank >= min_nd - 1:
+            return False
+        return True
 
-    def _fit_low_rank_shape(self):
-        Xc = self.data - self.center
+    def _probe_rank(self):
+        # Probe more generously than old 2*sqrt(d)
         d = self.dim
         n = self.n_samples
+        min_nd = min(d, n - 1 if n > 1 else 1)
+
+        if min_nd <= 0:
+            return 0
+
+        probe = max(8, int(np.ceil(3.0 * np.sqrt(d))))
+        probe = min(probe, min_nd, self._max_rank_cap)
+        return int(probe)
+
+    def _select_rank_by_energy(self, eigs, total_var):
+        if len(eigs) == 0:
+            return 0
+
+        if total_var <= 1e-18:
+            return 0
+
+        cum = np.cumsum(eigs)
+        ratio = cum / total_var
+        rank = int(np.searchsorted(ratio, self._energy_threshold) + 1)
+        rank = max(self._min_rank, rank)
+        rank = min(rank, len(eigs))
+        return int(rank)
+
+    def _fit_shape(self):
+        Xc = self.data - self.center
+        n, d = Xc.shape
 
         if n <= 1 or np.allclose(Xc, 0.0):
             self.rank = 0
             self.U = np.zeros((d, 0), dtype=float)
             self.cov_eigs = np.zeros((0,), dtype=float)
+            self.perp_var = max(self.epsilon, 1e-6)
             self._inv_diag = np.zeros((0,), dtype=float)
-            self._H_eigs = np.full(d, self.epsilon, dtype=float)
+            self._H_eigs = np.full(d, self.perp_var, dtype=float)
             self.approx_rank_used = 0
+            self.rank_selected = 0
             self.svd_mode_used = "degenerate"
             return
 
-        max_rank = self._auto_rank()
-        if max_rank <= 0:
-            max_rank = 1
+        # Total variance = trace(covariance)
+        total_var = float(np.sum(np.var(Xc, axis=0, ddof=0)))
+        total_var = max(total_var, 1e-18)
 
-        self.approx_rank_used = int(max_rank)
+        probe_rank = self._probe_rank()
+        min_nd = min(n, d)
 
         try:
-            if d <= self._approx_dim_threshold or max_rank >= min(Xc.shape):
-                # Low dimension or near-full rank case: use full SVD
-                _, s, Vt = np.linalg.svd(Xc, full_matrices=False)
-                s = s[:max_rank]
-                U_feat = Vt[:max_rank].T
-                self.svd_mode_used = "full_svd"
-            else:
-                # Higher dimension: use randomized SVD
+            if self._should_use_randomized_svd(Xc, probe_rank):
                 _, s, Vt = randomized_svd(
                     Xc,
-                    n_components=max_rank,
+                    n_components=probe_rank,
                     n_oversamples=min(self._svd_oversamples, max(2, d)),
                     n_iter=self._svd_n_iter,
                     random_state=0,
                 )
                 U_feat = Vt.T
+                eigs_probe = (s ** 2) / max(n, 1)
                 self.svd_mode_used = "randomized_svd"
+                self.approx_rank_used = probe_rank
+            else:
+                _, s, Vt = np.linalg.svd(Xc, full_matrices=False)
+                U_feat = Vt.T
+                eigs_probe = (s ** 2) / max(n, 1)
+                self.svd_mode_used = "full_svd"
+                self.approx_rank_used = min(len(eigs_probe), self._max_rank_cap)
         except Exception:
-            # Safe fallback
             _, s, Vt = np.linalg.svd(Xc, full_matrices=False)
-            s = s[:max_rank]
-            U_feat = Vt[:max_rank].T
+            U_feat = Vt.T
+            eigs_probe = (s ** 2) / max(n, 1)
             self.svd_mode_used = "fallback_full_svd"
+            self.approx_rank_used = min(len(eigs_probe), self._max_rank_cap)
 
-        cov_eigs = (s ** 2) / max(n, 1)
+        # Remove near-zero eigs
+        keep_nonzero = eigs_probe > 1e-12
+        eigs_probe = eigs_probe[keep_nonzero]
+        U_feat = U_feat[:, keep_nonzero]
 
-        keep = cov_eigs > 1e-12
-        self.U = U_feat[:, keep]
-        self.cov_eigs = cov_eigs[keep]
-        self.rank = len(self.cov_eigs)
-
-        if self.rank == 0:
+        if len(eigs_probe) == 0:
+            self.rank = 0
+            self.U = np.zeros((d, 0), dtype=float)
+            self.cov_eigs = np.zeros((0,), dtype=float)
+            self.perp_var = max(self.epsilon, 1e-6)
             self._inv_diag = np.zeros((0,), dtype=float)
-            self._H_eigs = np.full(d, self.epsilon, dtype=float)
+            self._H_eigs = np.full(d, self.perp_var, dtype=float)
+            self.rank_selected = 0
             return
 
-        self._inv_diag = 1.0 / (self.cov_eigs + self.epsilon)
+        rank = self._select_rank_by_energy(eigs_probe, total_var)
+        rank = min(rank, len(eigs_probe))
 
-        self._H_eigs = np.concatenate([
-            self.cov_eigs + self.epsilon,
-            np.full(max(0, d - self.rank), self.epsilon, dtype=float)
-        ])
+        self.U = U_feat[:, :rank]
+        self.cov_eigs = eigs_probe[:rank]
+        self.rank = len(self.cov_eigs)
+        self.rank_selected = self.rank
+
+        kept_var = float(np.sum(self.cov_eigs))
+        discarded_var = max(total_var - kept_var, 0.0)
+        perp_dim = max(d - self.rank, 1)
+
+        # Key fix:
+        # do NOT use epsilon as perpendicular variance.
+        # use residual variance per discarded dimension.
+        residual_perp_var = discarded_var / perp_dim
+
+        # Stabilize lower bound so perpendicular penalty is not unrealistically huge
+        if self.rank > 0:
+            floor_var = max(self.epsilon, 0.05 * float(np.median(self.cov_eigs)))
+        else:
+            floor_var = max(self.epsilon, total_var / max(d, 1))
+
+        self.perp_var = max(residual_perp_var, floor_var, 1e-8)
+
+        self._inv_diag = 1.0 / np.maximum(self.cov_eigs + self.epsilon, 1e-12)
+
+        if self.rank < d:
+            tail = np.full(d - self.rank, self.perp_var, dtype=float)
+            self._H_eigs = np.concatenate([self.cov_eigs + self.epsilon, tail])
+        else:
+            self._H_eigs = self.cov_eigs + self.epsilon
 
     def mahal_sq_points(self, points):
         X = np.asarray(points, dtype=float) - self.center
@@ -130,14 +212,20 @@ class FastEllipsoid:
             X = X[None, :]
 
         if self.rank == 0:
-            return np.sum(X * X, axis=1) / self.epsilon
+            return np.sum(X * X, axis=1) / self.perp_var
 
         proj = X @ self.U
         parallel_sq = np.sum((proj ** 2) * self._inv_diag[None, :], axis=1)
+
         total_sq = np.sum(X * X, axis=1)
         proj_sq = np.sum(proj * proj, axis=1)
-        perp_sq = np.maximum(total_sq - proj_sq, 0.0) / self.epsilon
-        return parallel_sq + perp_sq
+        perp_sq = np.maximum(total_sq - proj_sq, 0.0)
+
+        # Key fix:
+        # use residual variance, not epsilon
+        perp_term = perp_sq / self.perp_var
+
+        return parallel_sq + perp_term
 
     def _compute_rho(self):
         mahal_sq = self.mahal_sq_points(self.data)
@@ -158,6 +246,9 @@ class FastEllipsoid:
         return point2, point3
 
 
+# =========================
+# GE-DPC core helpers
+# =========================
 def get_num(ellipsoid):
     return ellipsoid.n_samples
 
@@ -264,9 +355,15 @@ def recursive_split_outlier_detection(initial_ellipsoids, data, t=2.0, max_itera
     return ellipsoid_list
 
 
+# =========================
+# Improved ellipsoid distance
+# =========================
 def _pair_distance_fast(ell_i, ell_j):
     diff = ell_i.center - ell_j.center
-    eps = max(ell_i.epsilon, ell_j.epsilon)
+
+    sigma_i = float(ell_i.perp_var)
+    sigma_j = float(ell_j.perp_var)
+    sigma = max(0.5 * (sigma_i + sigma_j), 1e-10)
 
     mats = []
     if ell_i.rank > 0:
@@ -275,18 +372,18 @@ def _pair_distance_fast(ell_i, ell_j):
         mats.append(ell_j.U * np.sqrt(0.5 * ell_j.cov_eigs)[None, :])
 
     if not mats:
-        return float(np.linalg.norm(diff) / np.sqrt(eps))
+        return float(np.linalg.norm(diff) / np.sqrt(sigma))
 
     A = np.concatenate(mats, axis=1)
     At_diff = A.T @ diff
-    M = np.eye(A.shape[1]) + (A.T @ A) / eps
+    M = np.eye(A.shape[1]) + (A.T @ A) / sigma
 
     try:
         z = np.linalg.solve(M, At_diff)
     except np.linalg.LinAlgError:
         z = np.linalg.pinv(M) @ At_diff
 
-    quad = (diff @ diff) / eps - (At_diff @ z) / (eps ** 2)
+    quad = (diff @ diff) / sigma - (At_diff @ z) / (sigma ** 2)
     return float(np.sqrt(max(quad, 0.0)))
 
 
@@ -325,6 +422,9 @@ def ellipse_min_dist(dist_mat, densities):
     return min_dists, nearest
 
 
+# =========================
+# Center selection
+# =========================
 def auto_select_centers(densities, min_dists, mode='knee', top_k=None, min_centers=1, max_centers=None):
     densities = np.asarray(densities, dtype=float)
     min_dists = np.asarray(min_dists, dtype=float)
@@ -429,17 +529,24 @@ def summarize_rank_info(ellipsoid_list):
     if not ellipsoid_list:
         return
 
-    ranks = [ell.approx_rank_used for ell in ellipsoid_list]
+    ranks = [ell.rank_selected for ell in ellipsoid_list]
     svd_modes = {}
+    perp_vars = []
+
     for ell in ellipsoid_list:
         svd_modes[ell.svd_mode_used] = svd_modes.get(ell.svd_mode_used, 0) + 1
+        perp_vars.append(ell.perp_var)
 
     print("Approximation summary (Tóm tắt xấp xỉ):")
-    print(f"- Auto rank rule: rank = min(d, n_samples, max(6, ceil(2 * sqrt(d))))")
+    print("- Rank selection: explained variance threshold = 0.99")
     print(f"- Rank min / avg / max: {np.min(ranks)} / {np.mean(ranks):.2f} / {np.max(ranks)}")
+    print(f"- Perp variance min / avg / max: {np.min(perp_vars):.6e} / {np.mean(perp_vars):.6e} / {np.max(perp_vars):.6e}")
     print(f"- SVD modes used: {svd_modes}")
 
 
+# =========================
+# Main pipeline
+# =========================
 def run_ge_dpc_highdim_fast(
     feature_file,
     label_file,
@@ -449,9 +556,16 @@ def run_ge_dpc_highdim_fast(
     auto_center_k=None,
     min_centers=1,
     max_centers=None,
+    normalize=True,
 ):
     data = np.loadtxt(feature_file, dtype=float)
     true_labels = np.loadtxt(label_file, dtype=float).astype(int)
+
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+
+    if normalize:
+        data = minmax_normalize(data)
 
     ellipsoid_kwargs = dict(
         epsilon=epsilon,
@@ -465,10 +579,10 @@ def run_ge_dpc_highdim_fast(
 
     print("Initial ellipsoid count (Số lượng ellipsoid ban đầu): 1")
     print(f"Input data shape (Kích thước dữ liệu đầu vào): n={data.shape[0]}, d={data.shape[1]}")
-    print("Approximation mode: auto-rank + fixed internal randomized SVD parameters")
-    print("Auto rank formula: rank = min(d, n_samples, max(6, ceil(2 * sqrt(d))))")
-    print("Fixed internal parameters: svd_oversamples=8, svd_n_iter=2")
-    print("Hybrid rule: d <= 20 -> full SVD, d > 20 -> randomized SVD")
+    print(f"Normalization: {'Min-Max [0,1]' if normalize else 'OFF'}")
+    print("Approximation mode: improved low-rank covariance + randomized SVD when necessary")
+    print("Rank rule: explained variance threshold = 0.99")
+    print("Key fix: perpendicular residual uses residual variance, not epsilon")
 
     split_iter = 0
     while True:
@@ -591,40 +705,28 @@ def run_ge_dpc_highdim_fast(
 if __name__ == '__main__':
     BASE_DIR = Path(__file__).resolve().parent
 
-    # feature_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone.txt'
-    # label_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone_label.txt'
-
+    # =========================
+    # Choose dataset here
+    # =========================
     feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
     label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Seed.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Seed_label.txt'
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'segment_3.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'segment_3_label.txt'
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'landsat_2.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'landsat_2_label.txt'
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'msplice_2.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'msplice_2_label.txt'
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'rice.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'rice_label.txt'
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'banknote.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'banknote_label.txt'
-    
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'breast_cancer.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'breast_cancer_label.txt'
-    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'hcv_data.txt'
-    # label_file = BASE_DIR / 'dataset' / 'label' / 'hcv_data_label.txt'
+
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
-    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
-    # label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
+
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'gas.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'gas_label.txt'
 
     epsilon = 1e-6
     outlier_t = 2.0
 
+    # You said this part will be tuned per dataset
     auto_center_mode = 'knee'
-    auto_center_k = 3
-    min_centers = 3
-    max_centers = 3
+    auto_center_k = 4
+    min_centers = 4
+    max_centers = 4
 
     run_ge_dpc_highdim_fast(
         feature_file=feature_file,
@@ -635,4 +737,5 @@ if __name__ == '__main__':
         auto_center_k=auto_center_k,
         min_centers=min_centers,
         max_centers=max_centers,
+        normalize=True,
     )
