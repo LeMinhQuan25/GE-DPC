@@ -485,12 +485,30 @@ if __name__ == '__main__':
     BASE_DIR = Path(__file__).resolve().parent
     # feature_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone.txt'
     # label_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone_label.txt'
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'htru2.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'htru2_label.txt'
+
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Seed.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Seed_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'segment_3.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'segment_3_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'landsat_2.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'landsat_2_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'msplice_2.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'msplice_2_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'rice.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'rice_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'banknote.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'banknote_label.txt'
+    
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'breast_cancer.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'breast_cancer_label.txt'
+    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'hcv_data.txt'
+    label_file = BASE_DIR / 'dataset' / 'label' / 'hcv_data_label.txt'
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
-    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
-    label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
 
     epsilon = 1e-6
     outlier_t = 2.0
@@ -499,11 +517,11 @@ if __name__ == '__main__':
     # - If auto_center_k is not None: exact top-k is used, min/max are ignored.
     # - If auto_center_k is None: mode + min/max are used.
     auto_center_mode = 'knee'
-    auto_center_k = 2
-    min_centers = 2
-    max_centers = 2
+    auto_center_k = 5
+    min_centers = 5
+    max_centers = 5
 
-    approx_rank = 20
+    approx_rank = 16
     svd_oversamples = 12
     svd_n_iter = 4
 

@@ -594,8 +594,8 @@ if __name__ == '__main__':
     # feature_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone.txt'
     # label_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone_label.txt'
 
-    feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
-    label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
     # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Seed.txt'
     # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Seed_label.txt'
     # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'segment_3.txt'
@@ -611,8 +611,8 @@ if __name__ == '__main__':
     
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'breast_cancer.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'breast_cancer_label.txt'
-    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'hcv_data.txt'
-    # label_file = BASE_DIR / 'dataset' / 'label' / 'hcv_data_label.txt'
+    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'hcv_data.txt'
+    label_file = BASE_DIR / 'dataset' / 'label' / 'hcv_data_label.txt'
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
@@ -622,9 +622,9 @@ if __name__ == '__main__':
     outlier_t = 2.0
 
     auto_center_mode = 'knee'
-    auto_center_k = 3
-    min_centers = 3
-    max_centers = 3
+    auto_center_k = 5
+    min_centers = 5
+    max_centers = 5
 
     run_ge_dpc_highdim_fast(
         feature_file=feature_file,

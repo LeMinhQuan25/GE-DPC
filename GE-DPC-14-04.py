@@ -1,259 +1,301 @@
 import time
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-from sklearn.metrics import accuracy_score, normalized_mutual_info_score, adjusted_rand_score
+from sklearn.metrics import (
+    accuracy_score,
+    adjusted_rand_score,
+    normalized_mutual_info_score,
+)
 from sklearn.utils.extmath import randomized_svd
 
 
 # ============================================================
-# GE-DPC for high-dimensional data
-# Improved version:
-# - still follows approximate matrix computation / randomized SVD
-# - fixes the main quality-loss issues of the previous version
+# Pure-development GE-DPC
+# ------------------------------------------------------------
+# Core principles kept from original GE-DPC pipeline:
+#   1) generate granular ellipsoids
+#   2) compute ellipsoid attributes
+#   3) compute inter-ellipsoid distances
+#   4) DPC center selection on ellipsoids
+#   5) propagate labels and map back to points
 #
-# Main fixes:
-# 1) Optional Min-Max normalization [0,1] inside pipeline
-# 2) No more harsh perpendicular penalty with 1/epsilon
-# 3) Rank is selected by explained variance, not fixed 2*sqrt(d)
-# 4) Randomized SVD only when data is truly large / high-dimensional
-# 5) Residual orthogonal variance is preserved to avoid shape distortion
+# Improvements added INSIDE the same pipeline:
+#   A) adaptive approximation inside each ellipsoid
+#   B) stronger minimum leaf size from safe split stage
+#   C) density clipping for degenerate/small ellipsoids
+#   D) pruning before exact ellipse-distance computation
+#
+# This file avoids dataset-level hybrid rule.
+# All datasets follow one unified pipeline.
 # ============================================================
 
 
-# =========================
-# Utility: normalization
-# =========================
-def minmax_normalize(X, eps=1e-12):
-    X = np.asarray(X, dtype=float)
-    col_min = np.min(X, axis=0)
-    col_max = np.max(X, axis=0)
-    col_range = col_max - col_min
-
-    constant_mask = col_range < eps
-    safe_range = np.where(constant_mask, 1.0, col_range)
-
-    X_norm = (X - col_min) / safe_range
-    X_norm[:, constant_mask] = 0.0
-    return X_norm
-
-
-# =========================
-# Improved ellipsoid
-# =========================
-class FastEllipsoid:
-    def __init__(self, data, indices, epsilon=1e-6):
+class AdaptiveEllipsoid:
+    def __init__(
+        self,
+        data: np.ndarray,
+        indices: np.ndarray,
+        epsilon: float = 1e-6,
+        randomized_min_samples: int = 64,
+        randomized_min_dim: int = 24,
+        svd_oversamples: int = 8,
+        svd_n_iter: int = 2,
+        small_ellipsoid_size: int = 3,
+        tiny_var_threshold: float = 1e-12,
+        covariance_shrinkage: float = 1e-6,
+    ):
         self.data = np.asarray(data, dtype=float)
         self.indices = np.asarray(indices, dtype=int)
         self.epsilon = float(epsilon)
+        self.randomized_min_samples = int(randomized_min_samples)
+        self.randomized_min_dim = int(randomized_min_dim)
+        self.svd_oversamples = int(svd_oversamples)
+        self.svd_n_iter = int(svd_n_iter)
+        self.small_ellipsoid_size = int(small_ellipsoid_size)
+        self.tiny_var_threshold = float(tiny_var_threshold)
+        self.covariance_shrinkage = float(covariance_shrinkage)
 
         if self.data.ndim != 2 or len(self.data) == 0:
             raise ValueError("data must be a non-empty 2D array")
 
         self.n_samples, self.dim = self.data.shape
         self.center = np.mean(self.data, axis=0)
+        self.Xc = self.data - self.center
 
-        # Internal fixed constants
-        self._energy_threshold = 0.99
-        self._min_rank = 2
-        self._max_rank_cap = 64
+        self.mode_used = "unknown"
+        self.rank = 0
+        self.approx_rank_used = 0
+        self.is_degenerate = False
+        self.is_small = self.n_samples <= self.small_ellipsoid_size
 
-        # Hybrid rule for switching to randomized SVD
-        self._rand_dim_threshold = 32
-        self._rand_sample_threshold = 256
+        # Shape representation:
+        # H ~= U diag(lambda) U^T + lambda_perp * (I - UU^T)
+        self.U = np.zeros((self.dim, 0), dtype=float)
+        self.shape_eigs = np.full(self.dim, self.epsilon, dtype=float)
+        self.parallel_eigs = np.zeros((0,), dtype=float)
+        self.perp_eig = self.epsilon
+        self.inv_parallel = np.zeros((0,), dtype=float)
 
-        self._svd_oversamples = 8
-        self._svd_n_iter = 2
-
-        self._fit_shape()
+        self._fit_shape_adaptive()
         self.rho = self._compute_rho()
         self.lengths = self._compute_lengths()
-        self.major_axis_endpoints = self.compute_major_axis_endpoints()
+        self.major_axis_endpoints = self._compute_major_axis_endpoints()
 
-    def _should_use_randomized_svd(self, Xc, probe_rank):
-        n, d = Xc.shape
-        min_nd = min(n, d)
-        if d < self._rand_dim_threshold:
-            return False
-        if n < self._rand_sample_threshold:
-            return False
-        if probe_rank >= min_nd - 1:
-            return False
-        return True
+    def _auto_rank(self) -> int:
+        rank_target = max(6, int(np.ceil(2.0 * np.sqrt(self.dim))))
+        return int(min(self.dim, self.n_samples, rank_target))
 
-    def _probe_rank(self):
-        # Probe more generously than old 2*sqrt(d)
-        d = self.dim
-        n = self.n_samples
-        min_nd = min(d, n - 1 if n > 1 else 1)
-
-        if min_nd <= 0:
-            return 0
-
-        probe = max(8, int(np.ceil(3.0 * np.sqrt(d))))
-        probe = min(probe, min_nd, self._max_rank_cap)
-        return int(probe)
-
-    def _select_rank_by_energy(self, eigs, total_var):
-        if len(eigs) == 0:
-            return 0
-
-        if total_var <= 1e-18:
-            return 0
-
-        cum = np.cumsum(eigs)
-        ratio = cum / total_var
-        rank = int(np.searchsorted(ratio, self._energy_threshold) + 1)
-        rank = max(self._min_rank, rank)
-        rank = min(rank, len(eigs))
-        return int(rank)
-
-    def _fit_shape(self):
-        Xc = self.data - self.center
-        n, d = Xc.shape
-
-        if n <= 1 or np.allclose(Xc, 0.0):
-            self.rank = 0
-            self.U = np.zeros((d, 0), dtype=float)
-            self.cov_eigs = np.zeros((0,), dtype=float)
-            self.perp_var = max(self.epsilon, 1e-6)
-            self._inv_diag = np.zeros((0,), dtype=float)
-            self._H_eigs = np.full(d, self.perp_var, dtype=float)
-            self.approx_rank_used = 0
-            self.rank_selected = 0
-            self.svd_mode_used = "degenerate"
+    def _fit_shape_adaptive(self) -> None:
+        # Case 1: degenerate / too small ellipsoid
+        if self.n_samples <= 1 or np.allclose(self.Xc, 0.0):
+            self._set_degenerate("degenerate")
             return
 
-        # Total variance = trace(covariance)
-        total_var = float(np.sum(np.var(Xc, axis=0, ddof=0)))
-        total_var = max(total_var, 1e-18)
+        if self.n_samples <= self.small_ellipsoid_size:
+            self._fit_small_covariance()
+            return
 
-        probe_rank = self._probe_rank()
-        min_nd = min(n, d)
+        # Case 2: medium ellipsoid -> cheap covariance eig
+        # Case 3: larger ellipsoid -> randomized SVD when truly worthwhile
+        if self.n_samples >= self.randomized_min_samples and self.dim >= self.randomized_min_dim:
+            self._fit_randomized_low_rank()
+        else:
+            self._fit_medium_covariance()
+
+    def _set_degenerate(self, mode: str) -> None:
+        self.mode_used = mode
+        self.rank = 0
+        self.approx_rank_used = 0
+        self.is_degenerate = True
+        self.U = np.zeros((self.dim, 0), dtype=float)
+        self.parallel_eigs = np.zeros((0,), dtype=float)
+        self.inv_parallel = np.zeros((0,), dtype=float)
+        self.perp_eig = self.epsilon
+        self.shape_eigs = np.full(self.dim, self.epsilon, dtype=float)
+
+    def _fit_small_covariance(self) -> None:
+        # Cheap and stable path for small ellipsoids.
+        # We keep full covariance in small dimension space.
+        cov = np.cov(self.Xc, rowvar=False, bias=True)
+        if np.ndim(cov) == 0:
+            cov = np.array([[float(cov)]], dtype=float)
+        cov = np.atleast_2d(cov)
+        if cov.shape != (self.dim, self.dim):
+            cov = np.diag(np.var(self.Xc, axis=0))
+
+        tr = float(np.trace(cov)) / max(self.dim, 1)
+        cov = cov + (self.covariance_shrinkage * max(tr, 1.0)) * np.eye(self.dim)
+
+        evals, evecs = np.linalg.eigh(cov)
+        evals = np.maximum(evals, self.epsilon)
+        order = np.argsort(evals)[::-1]
+        evals = evals[order]
+        evecs = evecs[:, order]
+
+        keep = evals > self.tiny_var_threshold
+        kept_evals = evals[keep]
+        kept_evecs = evecs[:, keep]
+
+        if len(kept_evals) == 0:
+            self._set_degenerate("small_degenerate")
+            return
+
+        self.mode_used = "small_cov_eig"
+        self.rank = len(kept_evals)
+        self.approx_rank_used = self.rank
+        self.U = kept_evecs
+        self.parallel_eigs = kept_evals
+        self.inv_parallel = 1.0 / np.maximum(self.parallel_eigs, self.epsilon)
+        self.perp_eig = max(float(np.min(self.parallel_eigs)), self.epsilon)
+        self.shape_eigs = np.maximum(evals, self.epsilon)
+        self.is_degenerate = self.rank == 0
+
+    def _fit_medium_covariance(self) -> None:
+        cov = np.cov(self.Xc, rowvar=False, bias=True)
+        if np.ndim(cov) == 0:
+            cov = np.array([[float(cov)]], dtype=float)
+        cov = np.atleast_2d(cov)
+        if cov.shape != (self.dim, self.dim):
+            cov = np.diag(np.var(self.Xc, axis=0))
+
+        tr = float(np.trace(cov)) / max(self.dim, 1)
+        cov = cov + (self.covariance_shrinkage * max(tr, 1.0)) * np.eye(self.dim)
+
+        evals, evecs = np.linalg.eigh(cov)
+        evals = np.maximum(evals, self.epsilon)
+        order = np.argsort(evals)[::-1]
+        evals = evals[order]
+        evecs = evecs[:, order]
+
+        target_rank = self._auto_rank()
+        keep = evals > self.tiny_var_threshold
+        keep_idx = np.where(keep)[0][:target_rank]
+
+        if len(keep_idx) == 0:
+            self._set_degenerate("medium_degenerate")
+            return
+
+        self.mode_used = "medium_cov_eig"
+        self.rank = len(keep_idx)
+        self.approx_rank_used = self.rank
+        self.U = evecs[:, keep_idx]
+        self.parallel_eigs = evals[keep_idx]
+        self.inv_parallel = 1.0 / np.maximum(self.parallel_eigs, self.epsilon)
+
+        dropped = evals[self.rank:]
+        if len(dropped) > 0:
+            self.perp_eig = max(float(np.mean(dropped)), self.epsilon)
+        else:
+            self.perp_eig = max(float(np.min(self.parallel_eigs)), self.epsilon)
+
+        self.shape_eigs = evals
+        self.is_degenerate = self.rank == 0
+
+    def _fit_randomized_low_rank(self) -> None:
+        target_rank = self._auto_rank()
+        target_rank = min(target_rank, min(self.Xc.shape))
+        if target_rank <= 0:
+            self._set_degenerate("randomized_degenerate")
+            return
 
         try:
-            if self._should_use_randomized_svd(Xc, probe_rank):
-                _, s, Vt = randomized_svd(
-                    Xc,
-                    n_components=probe_rank,
-                    n_oversamples=min(self._svd_oversamples, max(2, d)),
-                    n_iter=self._svd_n_iter,
-                    random_state=0,
-                )
-                U_feat = Vt.T
-                eigs_probe = (s ** 2) / max(n, 1)
-                self.svd_mode_used = "randomized_svd"
-                self.approx_rank_used = probe_rank
-            else:
-                _, s, Vt = np.linalg.svd(Xc, full_matrices=False)
-                U_feat = Vt.T
-                eigs_probe = (s ** 2) / max(n, 1)
-                self.svd_mode_used = "full_svd"
-                self.approx_rank_used = min(len(eigs_probe), self._max_rank_cap)
+            _, s, vt = randomized_svd(
+                self.Xc,
+                n_components=target_rank,
+                n_oversamples=min(self.svd_oversamples, max(2, self.dim)),
+                n_iter=self.svd_n_iter,
+                random_state=0,
+            )
+            cov_eigs = (s ** 2) / max(self.n_samples, 1)
+            cov_eigs = np.maximum(cov_eigs, self.epsilon)
+            keep = cov_eigs > self.tiny_var_threshold
+
+            if not np.any(keep):
+                self._set_degenerate("randomized_degenerate")
+                return
+
+            self.mode_used = "randomized_svd"
+            self.U = vt[keep].T
+            self.parallel_eigs = cov_eigs[keep]
+            self.rank = len(self.parallel_eigs)
+            self.approx_rank_used = int(target_rank)
+            self.inv_parallel = 1.0 / np.maximum(self.parallel_eigs, self.epsilon)
+
+            residual_energy = np.var(self.Xc, axis=0).sum() - self.parallel_eigs.sum()
+            residual_dims = max(self.dim - self.rank, 1)
+            self.perp_eig = max(float(residual_energy / residual_dims), self.epsilon)
+
+            tail = np.full(max(0, self.dim - self.rank), self.perp_eig, dtype=float)
+            self.shape_eigs = np.concatenate([self.parallel_eigs, tail])
+            self.is_degenerate = self.rank == 0
         except Exception:
-            _, s, Vt = np.linalg.svd(Xc, full_matrices=False)
-            U_feat = Vt.T
-            eigs_probe = (s ** 2) / max(n, 1)
-            self.svd_mode_used = "fallback_full_svd"
-            self.approx_rank_used = min(len(eigs_probe), self._max_rank_cap)
+            self._fit_medium_covariance()
+            self.mode_used = "fallback_medium_cov_eig"
 
-        # Remove near-zero eigs
-        keep_nonzero = eigs_probe > 1e-12
-        eigs_probe = eigs_probe[keep_nonzero]
-        U_feat = U_feat[:, keep_nonzero]
-
-        if len(eigs_probe) == 0:
-            self.rank = 0
-            self.U = np.zeros((d, 0), dtype=float)
-            self.cov_eigs = np.zeros((0,), dtype=float)
-            self.perp_var = max(self.epsilon, 1e-6)
-            self._inv_diag = np.zeros((0,), dtype=float)
-            self._H_eigs = np.full(d, self.perp_var, dtype=float)
-            self.rank_selected = 0
-            return
-
-        rank = self._select_rank_by_energy(eigs_probe, total_var)
-        rank = min(rank, len(eigs_probe))
-
-        self.U = U_feat[:, :rank]
-        self.cov_eigs = eigs_probe[:rank]
-        self.rank = len(self.cov_eigs)
-        self.rank_selected = self.rank
-
-        kept_var = float(np.sum(self.cov_eigs))
-        discarded_var = max(total_var - kept_var, 0.0)
-        perp_dim = max(d - self.rank, 1)
-
-        # Key fix:
-        # do NOT use epsilon as perpendicular variance.
-        # use residual variance per discarded dimension.
-        residual_perp_var = discarded_var / perp_dim
-
-        # Stabilize lower bound so perpendicular penalty is not unrealistically huge
-        if self.rank > 0:
-            floor_var = max(self.epsilon, 0.05 * float(np.median(self.cov_eigs)))
-        else:
-            floor_var = max(self.epsilon, total_var / max(d, 1))
-
-        self.perp_var = max(residual_perp_var, floor_var, 1e-8)
-
-        self._inv_diag = 1.0 / np.maximum(self.cov_eigs + self.epsilon, 1e-12)
-
-        if self.rank < d:
-            tail = np.full(d - self.rank, self.perp_var, dtype=float)
-            self._H_eigs = np.concatenate([self.cov_eigs + self.epsilon, tail])
-        else:
-            self._H_eigs = self.cov_eigs + self.epsilon
-
-    def mahal_sq_points(self, points):
+    def mahal_sq_points(self, points: np.ndarray) -> np.ndarray:
         X = np.asarray(points, dtype=float) - self.center
         if X.ndim == 1:
             X = X[None, :]
 
         if self.rank == 0:
-            return np.sum(X * X, axis=1) / self.perp_var
+            return np.sum(X * X, axis=1) / max(self.perp_eig, self.epsilon)
 
         proj = X @ self.U
-        parallel_sq = np.sum((proj ** 2) * self._inv_diag[None, :], axis=1)
+        parallel_sq = np.sum((proj ** 2) * self.inv_parallel[None, :], axis=1)
 
         total_sq = np.sum(X * X, axis=1)
         proj_sq = np.sum(proj * proj, axis=1)
-        perp_sq = np.maximum(total_sq - proj_sq, 0.0)
+        perp_energy = np.maximum(total_sq - proj_sq, 0.0)
+        perp_sq = perp_energy / max(self.perp_eig, self.epsilon)
+        return parallel_sq + perp_sq
 
-        # Key fix:
-        # use residual variance, not epsilon
-        perp_term = perp_sq / self.perp_var
-
-        return parallel_sq + perp_term
-
-    def _compute_rho(self):
+    def _compute_rho(self) -> float:
         mahal_sq = self.mahal_sq_points(self.data)
         mahal_sq = np.maximum(mahal_sq, 0.0)
         return float(np.sqrt(np.max(mahal_sq)))
 
-    def _compute_lengths(self):
-        return self.rho * np.sqrt(np.maximum(self._H_eigs, 1e-18))
+    def _compute_lengths(self) -> np.ndarray:
+        return self.rho * np.sqrt(np.maximum(self.shape_eigs, self.epsilon))
 
-    def compute_major_axis_endpoints(self):
+    def _compute_major_axis_endpoints(self) -> Tuple[np.ndarray, np.ndarray]:
         if self.n_samples <= 1:
             return self.center, self.center
 
+        if self.rank > 0:
+            axis = self.U[:, 0]
+            scores = self.Xc @ axis
+            i_min = int(np.argmin(scores))
+            i_max = int(np.argmax(scores))
+            return self.data[i_min], self.data[i_max]
+
         center_distances = np.linalg.norm(self.data - self.center, axis=1)
-        point1 = self.data[np.argmin(center_distances)]
-        point2 = self.data[np.argmax(np.linalg.norm(self.data - point1, axis=1))]
-        point3 = self.data[np.argmax(np.linalg.norm(self.data - point2, axis=1))]
-        return point2, point3
+        p1 = self.data[np.argmin(center_distances)]
+        p2 = self.data[np.argmax(np.linalg.norm(self.data - p1, axis=1))]
+        p3 = self.data[np.argmax(np.linalg.norm(self.data - p2, axis=1))]
+        return p2, p3
+
+    @property
+    def outer_radius(self) -> float:
+        return float(np.max(self.lengths)) if len(self.lengths) else 0.0
 
 
-# =========================
-# GE-DPC core helpers
-# =========================
-def get_num(ellipsoid):
+# ------------------------------
+# Metrics and helper functions
+# ------------------------------
+
+def get_num(ellipsoid: AdaptiveEllipsoid) -> int:
     return ellipsoid.n_samples
 
 
-def calculate_ellipsoid_density(ellipsoid):
+def calculate_ellipsoid_density(
+    ellipsoid: AdaptiveEllipsoid,
+    density_small_penalty: float = 0.2,
+    density_degenerate_penalty: float = 0.05,
+    min_center_size: int = 4,
+) -> float:
     n_samples = ellipsoid.n_samples
     axes_sum = float(np.sum(ellipsoid.lengths))
     axes_sum = max(axes_sum, 1e-12)
@@ -262,21 +304,35 @@ def calculate_ellipsoid_density(ellipsoid):
     total_mahal = float(np.sum(np.sqrt(np.maximum(mahal_sq, 0.0))))
     total_mahal = max(total_mahal, 1e-12)
 
-    return float((n_samples ** 2) / (axes_sum * total_mahal))
+    base_density = float((n_samples ** 2) / (axes_sum * total_mahal))
+
+    # Density clipping / penalty for unreliable ellipsoids
+    penalty = 1.0
+    if ellipsoid.is_degenerate:
+        penalty *= density_degenerate_penalty
+    if ellipsoid.n_samples < min_center_size:
+        penalty *= density_small_penalty
+
+    # Additional stability: forbid density explosion from tiny ellipsoids
+    effective_cap = max(1.0, float(n_samples))
+    clipped_density = min(base_density, base_density if n_samples >= min_center_size else effective_cap)
+    return float(clipped_density * penalty)
 
 
-def splits(ellipsoid_list, num, ellipsoid_kwargs):
-    new_ells = []
-    for ell in ellipsoid_list:
-        if get_num(ell) < num:
-            new_ells.append(ell)
-        else:
-            new_ells.extend(splits_ellipsoid(ell, ellipsoid_kwargs))
-    return new_ells
+# ------------------------------
+# Splitting
+# ------------------------------
+
+def build_ellipsoid(data: np.ndarray, indices: np.ndarray, ellipsoid_kwargs: Dict) -> AdaptiveEllipsoid:
+    return AdaptiveEllipsoid(data, indices, **ellipsoid_kwargs)
 
 
-def splits_ellipsoid(ellipsoid, ellipsoid_kwargs):
-    if ellipsoid.n_samples <= 1:
+def split_one_ellipsoid(
+    ellipsoid: AdaptiveEllipsoid,
+    ellipsoid_kwargs: Dict,
+    min_leaf_size: int,
+) -> List[AdaptiveEllipsoid]:
+    if ellipsoid.n_samples <= max(1, min_leaf_size):
         return [ellipsoid]
 
     data = ellipsoid.data
@@ -291,11 +347,11 @@ def splits_ellipsoid(ellipsoid, ellipsoid_kwargs):
     c1, c2 = data[mask1], data[mask2]
     i1, i2 = indices[mask1], indices[mask2]
 
-    if len(c1) == 0 or len(c2) == 0:
+    if len(c1) < min_leaf_size or len(c2) < min_leaf_size:
         return [ellipsoid]
 
-    ell1 = FastEllipsoid(c1, i1, **ellipsoid_kwargs)
-    ell2 = FastEllipsoid(c2, i2, **ellipsoid_kwargs)
+    ell1 = build_ellipsoid(c1, i1, ellipsoid_kwargs)
+    ell2 = build_ellipsoid(c2, i2, ellipsoid_kwargs)
 
     dist1_sq = ell1.mahal_sq_points(data)
     dist2_sq = ell2.mahal_sq_points(data)
@@ -305,16 +361,58 @@ def splits_ellipsoid(ellipsoid, ellipsoid_kwargs):
     c1, c2 = data[mask1], data[mask2]
     i1, i2 = indices[mask1], indices[mask2]
 
-    if len(c1) == 0 or len(c2) == 0:
+    if len(c1) < min_leaf_size or len(c2) < min_leaf_size:
         return [ellipsoid]
 
-    ell1 = FastEllipsoid(c1, i1, **ellipsoid_kwargs)
-    ell2 = FastEllipsoid(c2, i2, **ellipsoid_kwargs)
+    ell1 = build_ellipsoid(c1, i1, ellipsoid_kwargs)
+    ell2 = build_ellipsoid(c2, i2, ellipsoid_kwargs)
     return [ell1, ell2]
 
 
-def recursive_split_outlier_detection(initial_ellipsoids, data, t=2.0, max_iterations=10, ellipsoid_kwargs=None):
+def safe_split_stage(
+    root: AdaptiveEllipsoid,
+    split_threshold: int,
+    ellipsoid_kwargs: Dict,
+    min_leaf_size: int,
+) -> List[AdaptiveEllipsoid]:
+    ellipsoid_list = [root]
+    split_iter = 0
+
+    while True:
+        split_iter += 1
+        before = len(ellipsoid_list)
+        new_list: List[AdaptiveEllipsoid] = []
+
+        for ell in ellipsoid_list:
+            if get_num(ell) < split_threshold:
+                new_list.append(ell)
+            else:
+                new_list.extend(split_one_ellipsoid(ell, ellipsoid_kwargs, min_leaf_size=min_leaf_size))
+
+        ellipsoid_list = new_list
+        after = len(ellipsoid_list)
+
+        print(
+            f"Ellipsoid count after safe split iteration {split_iter} "
+            f"(Số lượng ellipsoid sau lần phân tách an toàn thứ {split_iter}): {after}"
+        )
+
+        if after == before:
+            break
+
+    return ellipsoid_list
+
+
+def recursive_split_outlier_detection(
+    initial_ellipsoids: List[AdaptiveEllipsoid],
+    data: np.ndarray,
+    t: float = 2.0,
+    max_iterations: int = 10,
+    ellipsoid_kwargs: Optional[Dict] = None,
+    min_leaf_size: int = 4,
+) -> List[AdaptiveEllipsoid]:
     ellipsoid_list = initial_ellipsoids.copy()
+    ellipsoid_kwargs = ellipsoid_kwargs or {}
 
     for _ in range(max_iterations):
         if not ellipsoid_list:
@@ -328,24 +426,23 @@ def recursive_split_outlier_detection(initial_ellipsoids, data, t=2.0, max_itera
             break
 
         kept = [ell for ell in ellipsoid_list if ell not in outliers]
-        replaced = []
-
-        min_leaf = max(2, int(np.ceil(np.sqrt(data.shape[0]) * 0.1)))
+        replaced: List[AdaptiveEllipsoid] = []
 
         for ell in outliers:
-            children = splits_ellipsoid(ell, ellipsoid_kwargs)
+            children = split_one_ellipsoid(ell, ellipsoid_kwargs, min_leaf_size=min_leaf_size)
             if len(children) != 2:
                 replaced.append(ell)
                 continue
 
-            if any(ch.n_samples < min_leaf for ch in children):
+            if any(ch.n_samples < min_leaf_size for ch in children):
                 replaced.append(ell)
                 continue
 
             parent_density = calculate_ellipsoid_density(ell)
             child_density_sum = sum(calculate_ellipsoid_density(ch) for ch in children)
 
-            if child_density_sum > t * parent_density:
+            # controlled outlier split
+            if child_density_sum > t * parent_density and not any(ch.is_degenerate for ch in children):
                 replaced.extend(children)
             else:
                 replaced.append(ell)
@@ -355,51 +452,78 @@ def recursive_split_outlier_detection(initial_ellipsoids, data, t=2.0, max_itera
     return ellipsoid_list
 
 
-# =========================
-# Improved ellipsoid distance
-# =========================
-def _pair_distance_fast(ell_i, ell_j):
-    diff = ell_i.center - ell_j.center
+# ------------------------------
+# Distance with pruning
+# ------------------------------
 
-    sigma_i = float(ell_i.perp_var)
-    sigma_j = float(ell_j.perp_var)
-    sigma = max(0.5 * (sigma_i + sigma_j), 1e-10)
+def _pair_distance_fast(ell_i: AdaptiveEllipsoid, ell_j: AdaptiveEllipsoid) -> float:
+    diff = ell_i.center - ell_j.center
+    eps = max(ell_i.epsilon, ell_j.epsilon)
 
     mats = []
     if ell_i.rank > 0:
-        mats.append(ell_i.U * np.sqrt(0.5 * ell_i.cov_eigs)[None, :])
+        mats.append(ell_i.U * np.sqrt(0.5 * ell_i.parallel_eigs)[None, :])
     if ell_j.rank > 0:
-        mats.append(ell_j.U * np.sqrt(0.5 * ell_j.cov_eigs)[None, :])
+        mats.append(ell_j.U * np.sqrt(0.5 * ell_j.parallel_eigs)[None, :])
 
     if not mats:
-        return float(np.linalg.norm(diff) / np.sqrt(sigma))
+        return float(np.linalg.norm(diff) / np.sqrt(eps))
 
     A = np.concatenate(mats, axis=1)
     At_diff = A.T @ diff
-    M = np.eye(A.shape[1]) + (A.T @ A) / sigma
+    M = np.eye(A.shape[1]) + (A.T @ A) / eps
 
     try:
         z = np.linalg.solve(M, At_diff)
     except np.linalg.LinAlgError:
         z = np.linalg.pinv(M) @ At_diff
 
-    quad = (diff @ diff) / sigma - (At_diff @ z) / (sigma ** 2)
+    quad = (diff @ diff) / eps - (At_diff @ z) / (eps ** 2)
     return float(np.sqrt(max(quad, 0.0)))
 
 
-def ellipse_distance(ellipsoid_list):
+def ellipse_distance_pruned(
+    ellipsoid_list: List[AdaptiveEllipsoid],
+    prune_margin: float = 3.0,
+) -> Tuple[np.ndarray, Dict[str, int]]:
     n = len(ellipsoid_list)
-    dist_mat = np.zeros((n, n), dtype=float)
+    dist_mat = np.full((n, n), np.inf, dtype=float)
+    np.fill_diagonal(dist_mat, 0.0)
+
+    exact_pairs = 0
+    pruned_pairs = 0
+
+    centers = np.array([ell.center for ell in ellipsoid_list], dtype=float)
+    outer_radii = np.array([ell.outer_radius for ell in ellipsoid_list], dtype=float)
 
     for i in range(n):
         for j in range(i + 1, n):
+            center_dist = float(np.linalg.norm(centers[i] - centers[j]))
+            bound = outer_radii[i] + outer_radii[j]
+
+            # Fast pruning: if clearly far apart, use cheap center-based bound instead
+            if center_dist > prune_margin * max(bound, 1e-12):
+                dist_mat[i, j] = dist_mat[j, i] = center_dist
+                pruned_pairs += 1
+                continue
+
             d = _pair_distance_fast(ellipsoid_list[i], ellipsoid_list[j])
             dist_mat[i, j] = dist_mat[j, i] = d
+            exact_pairs += 1
 
-    return dist_mat
+    stats = {
+        "total_pairs": n * (n - 1) // 2,
+        "exact_pairs": exact_pairs,
+        "pruned_pairs": pruned_pairs,
+    }
+    return dist_mat, stats
 
 
-def ellipse_min_dist(dist_mat, densities):
+# ------------------------------
+# DPC utilities
+# ------------------------------
+
+def ellipse_min_dist(dist_mat: np.ndarray, densities: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     densities = np.asarray(densities, dtype=float)
     order = np.argsort(-densities)
 
@@ -414,53 +538,73 @@ def ellipse_min_dist(dist_mat, densities):
             nearest[i] = cand[idx_local]
             min_dists[i] = dist_mat[i, nearest[i]]
         else:
-            min_dists[i] = np.max(dist_mat[i])
+            min_dists[i] = np.max(dist_mat[i][np.isfinite(dist_mat[i])])
 
     if len(order) > 0:
-        min_dists[order[0]] = np.max(min_dists)
+        finite_vals = min_dists[np.isfinite(min_dists)]
+        min_dists[order[0]] = np.max(finite_vals) if len(finite_vals) > 0 else 0.0
 
     return min_dists, nearest
 
 
-# =========================
-# Center selection
-# =========================
-def auto_select_centers(densities, min_dists, mode='knee', top_k=None, min_centers=1, max_centers=None):
+def auto_select_centers_robust(
+    ellipsoid_list: List[AdaptiveEllipsoid],
+    densities: np.ndarray,
+    min_dists: np.ndarray,
+    mode: str = "knee",
+    top_k: Optional[int] = None,
+    min_centers: int = 1,
+    max_centers: Optional[int] = None,
+    min_center_size: int = 4,
+) -> List[int]:
     densities = np.asarray(densities, dtype=float)
     min_dists = np.asarray(min_dists, dtype=float)
     n = len(densities)
-
     if n == 0:
         return []
 
+    valid = np.array(
+        [
+            (ell.n_samples >= min_center_size) and (not ell.is_degenerate)
+            for ell in ellipsoid_list
+        ],
+        dtype=bool,
+    )
+
     gamma = densities * min_dists
-    order = np.argsort(-gamma)
+    safe_gamma = gamma.copy()
+    safe_gamma[~valid] = -np.inf
+
+    order = np.argsort(-safe_gamma)
+    valid_order = [idx for idx in order if np.isfinite(safe_gamma[idx])]
+
+    if not valid_order:
+        order = np.argsort(-gamma)
+        k = 1 if top_k is None else max(1, min(top_k, n))
+        return order[:k].tolist()
 
     if top_k is not None:
-        k = int(max(1, min(top_k, n)))
-        return order[:k].tolist()
+        k = int(max(1, min(top_k, len(valid_order))))
+        return valid_order[:k]
 
-    if mode == 'threshold':
-        g = gamma[order]
+    g = np.array([safe_gamma[i] for i in valid_order], dtype=float)
+    m = len(g)
+
+    if m == 1 or np.allclose(g, g[0]):
+        k = min_centers if max_centers is None else min(min_centers, max_centers)
+        return valid_order[:k]
+
+    if mode == "threshold":
         thr = np.mean(g) + np.std(g)
-        centers = order[g > thr].tolist()
-
+        centers = [valid_order[i] for i in range(m) if g[i] > thr]
         if len(centers) < min_centers:
-            centers = order[:min_centers].tolist()
-
+            centers = valid_order[:min_centers]
         if max_centers is not None:
             centers = centers[:max_centers]
-
         return centers
 
-    g = gamma[order]
-
-    if n == 1 or np.allclose(g, g[0]):
-        k = min_centers if max_centers is None else min(min_centers, max_centers)
-        return order[:k].tolist()
-
-    x = np.arange(n, dtype=float)
-    x_norm = x / max(n - 1, 1)
+    x = np.arange(m, dtype=float)
+    x_norm = x / max(m - 1, 1)
     y_norm = (g - g.min()) / max(g.max() - g.min(), 1e-12)
 
     p1 = np.array([x_norm[0], y_norm[0]], dtype=float)
@@ -481,10 +625,10 @@ def auto_select_centers(densities, min_dists, mode='knee', top_k=None, min_cente
     if max_centers is not None:
         k = min(k, max_centers)
 
-    return order[:min(k, n)].tolist()
+    return valid_order[:min(k, m)]
 
 
-def ellipse_cluster(densities, centers, nearest):
+def ellipse_cluster(densities: np.ndarray, centers: List[int], nearest: np.ndarray) -> np.ndarray:
     labels = -np.ones(len(densities), dtype=int)
 
     for i, c in enumerate(centers):
@@ -504,7 +648,7 @@ def ellipse_cluster(densities, centers, nearest):
     return labels
 
 
-def align_labels(true_labels, pred_labels):
+def align_labels(true_labels: np.ndarray, pred_labels: np.ndarray) -> np.ndarray:
     true_classes = np.unique(true_labels)
     pred_classes = np.unique(pred_labels)
 
@@ -515,90 +659,88 @@ def align_labels(true_labels, pred_labels):
 
     row_ind, col_ind = linear_sum_assignment(-confusion)
     mapping = {pred_classes[j]: true_classes[i] for i, j in zip(row_ind, col_ind)}
-
     return np.array([mapping.get(label, -1) for label in pred_labels])
+
+
+# ------------------------------
+# Reporting helpers
+# ------------------------------
+
+def summarize_modes(ellipsoid_list: List[AdaptiveEllipsoid]) -> None:
+    if not ellipsoid_list:
+        return
+
+    ranks = [ell.approx_rank_used for ell in ellipsoid_list]
+    modes: Dict[str, int] = {}
+    for ell in ellipsoid_list:
+        modes[ell.mode_used] = modes.get(ell.mode_used, 0) + 1
+
+    print("Approximation summary (Tóm tắt xấp xỉ):")
+    print("- Adaptive mode inside each ellipsoid: degenerate / cheap covariance eig / randomized SVD")
+    print(f"- Rank min / avg / max: {np.min(ranks)} / {np.mean(ranks):.2f} / {np.max(ranks)}")
+    print(f"- Modes used: {modes}")
 
 
 def describe_center_strategy(auto_center_mode, auto_center_k, min_centers, max_centers):
     if auto_center_k is not None:
-        return f"fixed top-k mode: top_k={auto_center_k} (min/max ignored)"
-    return f"auto mode: mode={auto_center_mode}, min_centers={min_centers}, max_centers={max_centers}"
+        return f"robust top-k mode: top_k={auto_center_k} with degenerate/small-center filtering"
+    return f"robust auto mode: mode={auto_center_mode}, min_centers={min_centers}, max_centers={max_centers}"
 
 
-def summarize_rank_info(ellipsoid_list):
-    if not ellipsoid_list:
-        return
+# ------------------------------
+# Main runner
+# ------------------------------
 
-    ranks = [ell.rank_selected for ell in ellipsoid_list]
-    svd_modes = {}
-    perp_vars = []
-
-    for ell in ellipsoid_list:
-        svd_modes[ell.svd_mode_used] = svd_modes.get(ell.svd_mode_used, 0) + 1
-        perp_vars.append(ell.perp_var)
-
-    print("Approximation summary (Tóm tắt xấp xỉ):")
-    print("- Rank selection: explained variance threshold = 0.99")
-    print(f"- Rank min / avg / max: {np.min(ranks)} / {np.mean(ranks):.2f} / {np.max(ranks)}")
-    print(f"- Perp variance min / avg / max: {np.min(perp_vars):.6e} / {np.mean(perp_vars):.6e} / {np.max(perp_vars):.6e}")
-    print(f"- SVD modes used: {svd_modes}")
-
-
-# =========================
-# Main pipeline
-# =========================
-def run_ge_dpc_highdim_fast(
+def run_ge_dpc_pure_development(
     feature_file,
     label_file,
-    epsilon=1e-6,
-    outlier_t=2.0,
-    auto_center_mode='knee',
-    auto_center_k=None,
-    min_centers=1,
-    max_centers=None,
-    normalize=True,
+    epsilon: float = 1e-6,
+    outlier_t: float = 2.0,
+    auto_center_mode: str = "knee",
+    auto_center_k: Optional[int] = None,
+    min_centers: int = 1,
+    max_centers: Optional[int] = None,
+    min_leaf_size: Optional[int] = None,
+    prune_margin: float = 3.0,
+    min_center_size: int = 4,
 ):
     data = np.loadtxt(feature_file, dtype=float)
     true_labels = np.loadtxt(label_file, dtype=float).astype(int)
 
-    if data.ndim == 1:
-        data = data.reshape(-1, 1)
+    n, d = data.shape
+    if min_leaf_size is None:
+        min_leaf_size = max(4, int(np.ceil(np.sqrt(n) * 0.08)))
 
-    if normalize:
-        data = minmax_normalize(data)
+    split_threshold = int(np.ceil(np.sqrt(n)))
 
     ellipsoid_kwargs = dict(
         epsilon=epsilon,
+        randomized_min_samples=64,
+        randomized_min_dim=24,
+        svd_oversamples=8,
+        svd_n_iter=2,
+        small_ellipsoid_size=3,
+        tiny_var_threshold=1e-12,
+        covariance_shrinkage=1e-6,
     )
 
-    num = int(np.ceil(np.sqrt(data.shape[0])))
-
     t_gen_start = time.time()
-    root = FastEllipsoid(data, np.arange(data.shape[0], dtype=int), **ellipsoid_kwargs)
-    ellipsoid_list = [root]
+    root = build_ellipsoid(data, np.arange(n, dtype=int), ellipsoid_kwargs)
 
     print("Initial ellipsoid count (Số lượng ellipsoid ban đầu): 1")
-    print(f"Input data shape (Kích thước dữ liệu đầu vào): n={data.shape[0]}, d={data.shape[1]}")
-    print(f"Normalization: {'Min-Max [0,1]' if normalize else 'OFF'}")
-    print("Approximation mode: improved low-rank covariance + randomized SVD when necessary")
-    print("Rank rule: explained variance threshold = 0.99")
-    print("Key fix: perpendicular residual uses residual variance, not epsilon")
+    print(f"Input data shape (Kích thước dữ liệu đầu vào): n={n}, d={d}")
+    print("Approximation mode: pure-development adaptive ellipsoid fitting")
+    print("Adaptive rule: degenerate/small -> cheap covariance eig -> randomized SVD for sufficiently complex ellipsoids")
+    print(f"Safe split threshold: ceil(sqrt(n)) = {split_threshold}")
+    print(f"Minimum leaf size: {min_leaf_size}")
+    print(f"Distance pruning margin: {prune_margin}")
 
-    split_iter = 0
-    while True:
-        split_iter += 1
-        before = len(ellipsoid_list)
-        ellipsoid_list = splits(ellipsoid_list, num, ellipsoid_kwargs)
-        after = len(ellipsoid_list)
-
-        print(
-            f"Ellipsoid count after safe split iteration {split_iter} "
-            f"(Số lượng ellipsoid sau lần phân tách an toàn thứ {split_iter}): {after}"
-        )
-
-        if after == before:
-            break
-
+    ellipsoid_list = safe_split_stage(
+        root,
+        split_threshold=split_threshold,
+        ellipsoid_kwargs=ellipsoid_kwargs,
+        min_leaf_size=min_leaf_size,
+    )
     print(f"Total ellipsoid count after safe splitting (Tổng số ellipsoid sau phân tách an toàn): {len(ellipsoid_list)}")
 
     ellipsoid_list = recursive_split_outlier_detection(
@@ -607,6 +749,7 @@ def run_ge_dpc_highdim_fast(
         t=outlier_t,
         max_iterations=10,
         ellipsoid_kwargs=ellipsoid_kwargs,
+        min_leaf_size=min_leaf_size,
     )
 
     print(
@@ -614,14 +757,26 @@ def run_ge_dpc_highdim_fast(
         f"(Tổng số ellipsoid sau phân tách bằng phát hiện ngoại lệ): {len(ellipsoid_list)}"
     )
     print(f"A total of {len(ellipsoid_list)} ellipsoids were generated (Tổng cộng đã tạo {len(ellipsoid_list)} ellipsoid)")
-    summarize_rank_info(ellipsoid_list)
+    summarize_modes(ellipsoid_list)
 
     t_gen_end = time.time()
     time_gen = t_gen_end - t_gen_start
 
     t_attr_start = time.time()
-    densities = np.array([calculate_ellipsoid_density(ell) for ell in ellipsoid_list], dtype=float)
-    dist_matrix = ellipse_distance(ellipsoid_list)
+    densities = np.array(
+        [
+            calculate_ellipsoid_density(
+                ell,
+                density_small_penalty=0.2,
+                density_degenerate_penalty=0.05,
+                min_center_size=min_center_size,
+            )
+            for ell in ellipsoid_list
+        ],
+        dtype=float,
+    )
+
+    dist_matrix, prune_stats = ellipse_distance_pruned(ellipsoid_list, prune_margin=prune_margin)
     min_dists, nearest = ellipse_min_dist(dist_matrix, densities)
 
     axes_sums = [np.sum(ell.lengths) for ell in ellipsoid_list]
@@ -629,6 +784,10 @@ def run_ge_dpc_highdim_fast(
     outlier_ellipsoids = [ell for ell in ellipsoid_list if np.sum(ell.lengths) > 2 * axes_sum_avg]
 
     print(f"Number of outlier ellipsoids (Số lượng ellipsoid ngoại lệ): {len(outlier_ellipsoids)}")
+    print(
+        f"Distance pruning stats: total_pairs={prune_stats['total_pairs']}, "
+        f"exact_pairs={prune_stats['exact_pairs']}, pruned_pairs={prune_stats['pruned_pairs']}"
+    )
 
     t_attr_end = time.time()
     time_attr = t_attr_end - t_attr_start
@@ -636,13 +795,15 @@ def run_ge_dpc_highdim_fast(
     print("Auto-selecting cluster centers from decision values (Tự động chọn tâm cụm từ các giá trị decision)...")
     print("Center strategy:", describe_center_strategy(auto_center_mode, auto_center_k, min_centers, max_centers))
 
-    selected = auto_select_centers(
+    selected = auto_select_centers_robust(
+        ellipsoid_list,
         densities,
         min_dists,
         mode=auto_center_mode,
         top_k=auto_center_k,
         min_centers=min_centers,
         max_centers=max_centers,
+        min_center_size=min_center_size,
     )
 
     gamma = densities * min_dists
@@ -677,65 +838,67 @@ def run_ge_dpc_highdim_fast(
     print(f"1. Ellipsoid generation time (Thời gian tạo ellipsoid): {time_gen:.14f} seconds (giây)")
     print(f"2. Attribute computation time (Thời gian tính thuộc tính): {time_attr:.14f} seconds (giây)")
     print(f"3. Clustering computation time (Thời gian tính phân cụm): {time_cluster:.14f} seconds (giây) (mapping time excluded / không tính thời gian ánh xạ)")
-
-    total_valid_time1 = time_attr + time_cluster
-    total_valid_time2 = time_gen + time_attr + time_cluster
-
     print("-" * 30)
-    print(f"Total effective runtime (attributes + clustering) (Tổng thời gian hiệu dụng: thuộc tính + phân cụm): {total_valid_time1:.14f} seconds (giây)")
-    print(f"Total effective runtime of the program (Tổng thời gian chạy hiệu dụng của chương trình): {total_valid_time2:.14f} seconds (giây)")
-    print("-" * 30)
+    print(f"Total effective runtime (attributes + clustering) (Tổng thời gian hiệu dụng: thuộc tính + phân cụm): {(time_attr + time_cluster):.14f} seconds (giây)")
+    print(f"Total effective runtime of the program (Tổng thời gian chạy hiệu dụng của chương trình): {(time_gen + time_attr + time_cluster):.14f} seconds (giây)")
 
     return {
-        'acc': acc,
-        'nmi': nmi,
-        'ari': ari,
-        'selected_centers': selected,
-        'n_ellipsoids': len(ellipsoid_list),
-        'pred_labels': pred_labels,
-        'aligned_pred_labels': aligned_pred,
-        'generation_time': time_gen,
-        'attribute_time': time_attr,
-        'cluster_time': time_cluster,
-        'total_valid_time_attr_cluster': total_valid_time1,
-        'total_valid_time_program': total_valid_time2,
+        "ACC": acc,
+        "NMI": nmi,
+        "ARI": ari,
+        "time_gen": time_gen,
+        "time_attr": time_attr,
+        "time_cluster": time_cluster,
+        "n_ellipsoids": len(ellipsoid_list),
+        "selected_centers": selected,
+        "pred_labels": pred_labels,
+        "ge_labels": ge_labels,
+        "densities": densities,
+        "min_dists": min_dists,
+        "gamma": gamma,
+        "distance_prune_stats": prune_stats,
     }
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     BASE_DIR = Path(__file__).resolve().parent
+    # feature_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone.txt'
+    # label_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone_label.txt'
 
-    # =========================
-    # Choose dataset here
-    # =========================
     feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
     label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Seed.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Seed_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'segment_3.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'segment_3_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'landsat_2.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'landsat_2_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'msplice_2.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'msplice_2_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'rice.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'rice_label.txt'
+    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'banknote.txt'
+    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'banknote_label.txt'
+    
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'breast_cancer.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'breast_cancer_label.txt'
-
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'hcv_data.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'hcv_data_label.txt'
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
 
-    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'gas.txt'
-    # label_file = BASE_DIR / 'dataset' / 'label' / 'gas_label.txt'
-
-    epsilon = 1e-6
-    outlier_t = 2.0
-
-    # You said this part will be tuned per dataset
-    auto_center_mode = 'knee'
-    auto_center_k = 4
-    min_centers = 4
-    max_centers = 4
-
-    run_ge_dpc_highdim_fast(
+    run_ge_dpc_pure_development(
         feature_file=feature_file,
         label_file=label_file,
-        epsilon=epsilon,
-        outlier_t=outlier_t,
-        auto_center_mode=auto_center_mode,
-        auto_center_k=auto_center_k,
-        min_centers=min_centers,
-        max_centers=max_centers,
-        normalize=True,
+        epsilon=1e-6,
+        outlier_t=2.0,
+        auto_center_mode="knee",
+        auto_center_k=None,
+        min_centers=1,
+        max_centers=None,
+        min_leaf_size=None,
+        prune_margin=3.0,
+        min_center_size=4,
     )
