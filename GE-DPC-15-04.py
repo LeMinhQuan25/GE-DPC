@@ -747,6 +747,10 @@ def get_default_dataset_registry(base_dir: Path) -> Dict[str, Tuple[Path, Path]]
             base_dir / "data" / "miniboone" / "miniboone.txt",
             base_dir / "data" / "miniboone" / "miniboone_label.txt",
         ),
+        "covertype": (
+            base_dir / "data" / "covertype" / "covertype.txt",
+            base_dir / "data" / "covertype" / "covertype_label.txt",
+        ),
         "iris": (
             base_dir / "real_dataset_and_label" / "real_datasets" / "Iris.txt",
             base_dir / "real_dataset_and_label" / "real_datasets_label" / "Iris_label.txt",
@@ -900,7 +904,7 @@ if __name__ == "__main__":
     # --------------------------------------------------------
     # Chọn 1 dataset để chạy
     # --------------------------------------------------------
-    dataset_name = "rice"
+    dataset_name = "miniboone"
 
     run_named_dataset(
         dataset_name=dataset_name,
