@@ -258,12 +258,11 @@ def splits_ellipsoid(ellipsoid: Ellipsoid, epsilon: Optional[float] = None) -> L
     """
     Tách một ellipsoid thành hai ellipsoid con.
 
-    Kế thừa logic gốc gồm 2 pha:
-    1) Chia sơ bộ theo 2 đầu mút trục chính.
-    2) Gán lại mỗi điểm cho ellipsoid gần hơn theo Mahalanobis distance.
+    Bản vá:
+    1) Đổi split sơ bộ từ endpoint-distance sang principal-axis median split.
+    2) Giữ nguyên Phase 2: Mahalanobis reassignment.
 
-    Phần mới:
-    - Pha 2 được vector hóa bằng mahal_sq_points(), không còn loop điểm + inv(H).
+    Không thêm tham số mới.
     """
     if ellipsoid.n_samples <= 1:
         return [ellipsoid]
@@ -271,16 +270,29 @@ def splits_ellipsoid(ellipsoid: Ellipsoid, epsilon: Optional[float] = None) -> L
     eps = ellipsoid.epsilon if epsilon is None else float(epsilon)
     data = ellipsoid.data
     indices = ellipsoid.indices
-    point1, point2 = ellipsoid.major_axis_endpoints
 
-    # ------------------------------
-    # Phase 1: split sơ bộ theo khoảng cách Euclidean đến 2 đầu mút
-    # ------------------------------
-    dist_to_point1 = np.linalg.norm(data - point1, axis=1)
-    dist_to_point2 = np.linalg.norm(data - point2, axis=1)
+    # --------------------------------------------------
+    # Phase 1 (mới): split theo trục chính dài nhất + median
+    # --------------------------------------------------
+    lengths, rotation = ellipsoid.lengths_rotation
+    major_axis_idx = int(np.argmax(lengths))
+    major_axis = rotation[:, major_axis_idx]
 
-    cluster1_mask = dist_to_point1 < dist_to_point2
+    projections = (data - ellipsoid.center) @ major_axis
+    split_value = float(np.median(projections))
+
+    cluster1_mask = projections <= split_value
     cluster2_mask = ~cluster1_mask
+
+    # Fallback nếu dữ liệu suy biến làm 1 phía rỗng
+    if not np.any(cluster1_mask) or not np.any(cluster2_mask):
+        order = np.argsort(projections)
+        mid = len(order) // 2
+        if mid == 0 or mid == len(order):
+            return [ellipsoid]
+        cluster1_mask = np.zeros(len(data), dtype=bool)
+        cluster1_mask[order[:mid]] = True
+        cluster2_mask = ~cluster1_mask
 
     cluster1 = data[cluster1_mask]
     cluster2 = data[cluster2_mask]
@@ -293,13 +305,17 @@ def splits_ellipsoid(ellipsoid: Ellipsoid, epsilon: Optional[float] = None) -> L
     ell1 = Ellipsoid(cluster1, cluster1_idx, epsilon=eps)
     ell2 = Ellipsoid(cluster2, cluster2_idx, epsilon=eps)
 
-    # ------------------------------
-    # Phase 2: gán lại bằng Mahalanobis distance
-    # ------------------------------
+    # --------------------------------------------------
+    # Phase 2 (giữ nguyên): gán lại bằng Mahalanobis distance
+    # --------------------------------------------------
     dist1_sq = ell1.mahal_sq_points(data)
     dist2_sq = ell2.mahal_sq_points(data)
     new_cluster1_mask = dist1_sq < dist2_sq
     new_cluster2_mask = ~new_cluster1_mask
+
+    # Fallback nếu reassignment làm sập 1 cụm
+    if not np.any(new_cluster1_mask) or not np.any(new_cluster2_mask):
+        return [ellipsoid]
 
     cluster1 = data[new_cluster1_mask]
     cluster2 = data[new_cluster2_mask]
@@ -327,9 +343,12 @@ def recursive_split_outlier_detection(
     """
     Tách tiếp các ellipsoid ngoại lệ.
 
-    Kế thừa logic gốc:
-    - Một ellipsoid bị xem là ngoại lệ nếu tổng độ dài trục > 2 * trung bình.
-    - Chỉ chấp nhận split nếu tổng mật độ con đủ lớn hơn mật độ cha theo ngưỡng t.
+    Bản vá:
+    1) Đổi gate outlier từ mean sang median để robust hơn.
+    2) Tránh split lệch/ảo mà không thêm tham số mới.
+    3) Giữ lại density gate gốc với t.
+
+    Không thêm tham số mới.
     """
     ellipsoid_list = list(initial_ellipsoids)
 
@@ -338,16 +357,23 @@ def recursive_split_outlier_detection(
             break
 
         axes_sums = np.array([np.sum(ell.lengths) for ell in ellipsoid_list], dtype=float)
-        axes_sum_avg = float(np.mean(axes_sums)) if len(axes_sums) > 0 else 0.0
+        if len(axes_sums) == 0:
+            break
+
+        # --------------------------------------------------
+        # Gate mới: median robust hơn mean
+        # --------------------------------------------------
+        axes_sum_med = float(np.median(axes_sums))
 
         outlier_ellipsoids = [
-            ell for ell in ellipsoid_list if np.sum(ell.lengths) > 2.0 * axes_sum_avg
+            ell for ell in ellipsoid_list if np.sum(ell.lengths) > 2.0 * axes_sum_med
         ]
         if not outlier_ellipsoids:
             break
 
         normal_ellipsoids = [ell for ell in ellipsoid_list if ell not in outlier_ellipsoids]
         new_ellipsoids: List[Ellipsoid] = []
+
         min_leaf = max(2, int(np.ceil(np.sqrt(data.shape[0]) * 0.1)))
 
         for outlier_ell in outlier_ellipsoids:
@@ -357,19 +383,69 @@ def recursive_split_outlier_detection(
                 new_ellipsoids.append(outlier_ell)
                 continue
 
-            if any(child.n_samples < min_leaf for child in children):
+            c1, c2 = children
+            n1, n2 = c1.n_samples, c2.n_samples
+            parent_n = outlier_ell.n_samples
+
+            # ------------------------------------------
+            # Rule 1: child quá nhỏ thì bỏ split
+            # ------------------------------------------
+            if n1 < min_leaf or n2 < min_leaf:
                 new_ellipsoids.append(outlier_ell)
                 continue
 
+            # ------------------------------------------
+            # Rule 2: tránh split lệch/ảo
+            # - một child rất nhỏ
+            # - child còn lại gần như giữ toàn bộ parent
+            # Không thêm tham số mới, dùng trực tiếp min_leaf
+            # ------------------------------------------
+            small_n = min(n1, n2)
+            large_n = max(n1, n2)
+
+            if small_n <= min_leaf and large_n >= parent_n - min_leaf:
+                new_ellipsoids.append(outlier_ell)
+                continue
+
+            # ------------------------------------------
+            # Rule 3: split phải cải thiện hình học
+            # Nếu tổng độ dài trục của 2 child không giảm
+            # thì split này thường không đáng nhận
+            # ------------------------------------------
+            parent_axes_sum = float(np.sum(outlier_ell.lengths))
+            child_axes_sum = float(np.sum(c1.lengths) + np.sum(c2.lengths))
+
+            if child_axes_sum >= parent_axes_sum:
+                new_ellipsoids.append(outlier_ell)
+                continue
+
+            # ------------------------------------------
+            # Rule 4: giữ density gate gốc
+            # ------------------------------------------
             parent_density = calculate_ellipsoid_density(outlier_ell)
-            child_density_sum = sum(calculate_ellipsoid_density(child) for child in children)
+            child_density_sum = (
+                calculate_ellipsoid_density(c1) + calculate_ellipsoid_density(c2)
+            )
 
             if child_density_sum > t * parent_density:
                 new_ellipsoids.extend(children)
             else:
                 new_ellipsoids.append(outlier_ell)
 
-        ellipsoid_list = normal_ellipsoids + new_ellipsoids
+        updated_list = normal_ellipsoids + new_ellipsoids
+
+        # Không còn thay đổi thì dừng
+        if len(updated_list) == len(ellipsoid_list):
+            same_structure = True
+            for a, b in zip(updated_list, ellipsoid_list):
+                if a is not b:
+                    same_structure = False
+                    break
+            if same_structure:
+                ellipsoid_list = updated_list
+                break
+
+        ellipsoid_list = updated_list
 
     return ellipsoid_list
 
@@ -898,14 +974,14 @@ if __name__ == "__main__":
     outlier_t = 2.0
 
     auto_center_mode = "knee" #Tham số sẽ thay đổi theo từng tập data để chọn center
-    auto_center_k = 2
+    auto_center_k = None
     min_centers = 2
-    max_centers = 2
+    max_centers = 3
 
     # --------------------------------------------------------
     # Chọn 1 dataset để chạy
     # --------------------------------------------------------
-    dataset_name = "miniboone"
+    dataset_name = "banknote"
 
     run_named_dataset(
         dataset_name=dataset_name,
