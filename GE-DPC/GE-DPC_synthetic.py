@@ -370,7 +370,7 @@ if __name__ == "__main__":
                   }
     np.set_printoptions(threshold=1e16)
     # 请修改为您本地的路径
-    data = np.loadtxt('/Users/quanle/Documents/Master/Thesis/Code/GE-DPC-main/real_dataset_and_label/real_datasets/msplice_2.txt')
+    data = np.loadtxt('/Users/minhquan/Documents/Master/Thesis/Code/GE-DPC-main/real_dataset_and_label/real_datasets/msplice_2.txt')
     # 初始绘图 (排除时间)
     print("绘制初始数据分布...")
     draw_point(data)
