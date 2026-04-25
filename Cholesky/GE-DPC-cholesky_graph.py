@@ -1,3 +1,20 @@
+"""
+GE-DPC Quality-Improved Version
+================================
+
+Huong phat trien:
+1) Giu nguyen sinh granular-ellipsoid cua GE-DPC.
+2) Giu Cholesky + cache de tang toc Mahalanobis distance.
+3) Cai tien chon center bang gamma + redundancy pruning.
+4) Thay gan nhan don bang graph-based multi-neighbor propagation.
+5) Them merge cum nhe neu chon du center.
+
+Ghi chu quan trong:
+- File nay khong dung ground-truth label trong qua trinh phan cum.
+- Label that chi dung de danh gia ACC/NMI/ARI sau cung.
+- Cac nguong moi deu duoc suy ra tu dist_matrix/gamma, han che them tham so thu cong.
+"""
+
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -9,43 +26,21 @@ from sklearn.metrics import accuracy_score, adjusted_rand_score, normalized_mutu
 
 
 # ============================================================
-# GE-DPC with Cholesky + Cache
-# ------------------------------------------------------------
-# Mục tiêu của bản này:
-# 1) Giữ nguyên logic chính của code gốc GE-DPC.
-# 2) KHÔNG dùng approximate matrix computation / randomized SVD.
-# 3) Thay các phép nghịch đảo ma trận tường minh bằng Cholesky + solve.
-# 4) Thêm cache cho các đại lượng bị dùng lặp lại nhiều lần.
-#
-# Ghi chú kế thừa / phần mới:
-# - Kế thừa từ code gốc:
-#   + Quy trình tạo ellipsoid
-#   + Safe split
-#   + Outlier-detection split
-#   + Density, ellipse distance, min-dist, center selection, label mapping
-#   + Cách đánh giá ACC / NMI / ARI
-#
-# - Phần mới trong bản này:
-#   + Không còn np.linalg.inv(H)
-#   + Dùng cho_factor / cho_solve để tính Mahalanobis distance
-#   + Cache: covariance, H, Cholesky factor, rho, principal axes,
-#            major-axis endpoints, density
-#   + Vector hóa một số phép tính điểm-đến-ellipsoid
+# Ellipsoid with Cholesky + Cache
 # ============================================================
-
-
 class Ellipsoid:
     """
     Granular Ellipsoid cho GE-DPC.
 
-    Kế thừa ý tưởng từ code gốc:
-    - Mỗi ellipsoid giữ tập điểm con, tâm, covariance, shape matrix H,
-      rho, chiều dài các trục và hai đầu mút trục chính để phục vụ split.
+    Ke thua tu GE-DPC goc:
+    - Moi ellipsoid giu tap diem con, tam, covariance, shape matrix H,
+      rho, truc chinh va endpoints de phuc vu split.
 
-    Điểm mới của bản này:
-    - Không tính inv(H) trực tiếp.
-    - Dùng Cholesky decomposition của H để tính Mahalanobis distance.
-    - Dùng cache để tránh tính lại các đại lượng trung gian.
+    Phan moi / huong phat trien:
+    - Khong tinh inv(H) truc tiep.
+    - Dung Cholesky decomposition + solve de tinh Mahalanobis distance.
+    - Cache cac dai luong lap lai: covariance, H, Cholesky factor,
+      rho, axes, endpoints, density.
     """
 
     def __init__(self, data: np.ndarray, indices: np.ndarray, epsilon: float = 1e-6):
@@ -59,9 +54,6 @@ class Ellipsoid:
         self.n_samples, self.dim = self.data.shape
         self.center = np.mean(self.data, axis=0)
 
-        # ------------------------------
-        # Cache nội bộ
-        # ------------------------------
         self._cov_matrix: Optional[np.ndarray] = None
         self._H_matrix: Optional[np.ndarray] = None
         self._chol_factor: Optional[Tuple[np.ndarray, bool]] = None
@@ -70,18 +62,9 @@ class Ellipsoid:
         self._major_axis_endpoints: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self._density: Optional[float] = None
 
-    # ========================================================
-    # Cached geometric properties
-    # ========================================================
     @property
     def cov_matrix(self) -> np.ndarray:
-        """
-        Ma trận hiệp phương sai.
-
-        Kế thừa logic gốc:
-        - n_samples == 1 -> covariance = 0
-        - bias=True để khớp code gốc
-        """
+        """Covariance matrix. Bias=True de bam sat code GE-DPC goc."""
         if self._cov_matrix is None:
             if self.n_samples == 1:
                 self._cov_matrix = np.zeros((self.dim, self.dim), dtype=float)
@@ -91,52 +74,31 @@ class Ellipsoid:
 
     @property
     def H_matrix(self) -> np.ndarray:
-        """
-        Shape matrix H = covariance + epsilon * I.
-
-        Kế thừa logic gốc.
-        Đây là ma trận được dùng trong Mahalanobis distance.
-        """
+        """Shape matrix H = covariance + epsilon * I."""
         if self._H_matrix is None:
             self._H_matrix = self.cov_matrix + self.epsilon * np.eye(self.dim, dtype=float)
         return self._H_matrix
 
     @property
     def chol_factor(self) -> Tuple[np.ndarray, bool]:
-        """
-        Phân rã Cholesky của H.
-
-        Phần mới:
-        - Thay cho inv(H) trong code gốc.
-        - Chỉ tính một lần rồi cache.
-        """
+        """Cholesky factor cua H, tinh mot lan roi cache."""
         if self._chol_factor is None:
             self._chol_factor = cho_factor(self.H_matrix, lower=True, check_finite=False)
         return self._chol_factor
 
     def solve_H(self, rhs: np.ndarray) -> np.ndarray:
-        """
-        Giải hệ H x = rhs bằng Cholesky.
-
-        Phần mới, dùng để thay cho nhân với inv(H).
-        Hỗ trợ cả rhs là vector hoặc ma trận.
-        """
+        """Giai Hx = rhs bang Cholesky solve."""
         return cho_solve(self.chol_factor, rhs, check_finite=False)
 
     def mahal_sq_points(self, points: np.ndarray) -> np.ndarray:
         """
-        Tính bình phương khoảng cách Mahalanobis từ nhiều điểm đến ellipsoid.
-
-        Kế thừa mục đích từ code gốc, nhưng phần tính toán là mới:
-        - Gốc: diff^T inv(H) diff
-        - Mới: diff^T solve(H, diff)
-
-        Đầu ra luôn là vector 1D có độ dài = số điểm.
+        Binh phuong Mahalanobis distance tu nhieu diem den ellipsoid.
+        Goc: diff^T inv(H) diff.
+        Moi: diff^T solve(H, diff).
         """
         X = np.asarray(points, dtype=float)
         if X.ndim == 1:
             X = X[None, :]
-
         diffs = X - self.center
         solved = self.solve_H(diffs.T).T
         mahal_sq = np.einsum("ij,ij->i", diffs, solved)
@@ -144,11 +106,7 @@ class Ellipsoid:
 
     @property
     def rho(self) -> float:
-        """
-        Bán kính Mahalanobis lớn nhất từ tâm đến các điểm trong ellipsoid.
-
-        Kế thừa logic gốc, chỉ đổi cách tính distance sang Cholesky solve.
-        """
+        """Ban kinh Mahalanobis lon nhat cua cac diem trong ellipsoid."""
         if self._rho is None:
             self._rho = float(np.sqrt(np.max(self.mahal_sq_points(self.data))))
         return self._rho
@@ -156,18 +114,9 @@ class Ellipsoid:
     @property
     def lengths_rotation(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Trả về:
-        - lengths: độ dài các trục chính của ellipsoid
-        - rotation: ma trận vector riêng
-
-        Kế thừa logic gốc nhưng tránh eig(inv(H)).
-        Vì nếu lambda là trị riêng của H, thì trị riêng của inv(H) là 1/lambda.
-        Trong code gốc:
-            lengths = rho / sqrt(eig(inv(H)))
-        Tương đương:
-            lengths = rho * sqrt(eig(H))
-
-        Cách này giữ đúng hình học nhưng ổn định số hơn.
+        Tra ve lengths va rotation.
+        Neu lambda la tri rieng cua H thi length = rho * sqrt(lambda).
+        Cach nay tranh eig(inv(H)).
         """
         if self._lengths_rotation is None:
             eigvals_H, eigvecs_H = np.linalg.eigh(self.H_matrix)
@@ -186,14 +135,7 @@ class Ellipsoid:
 
     @property
     def major_axis_endpoints(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Lấy hai điểm đầu mút trục chính để chia ellipsoid.
-
-        Kế thừa hoàn toàn logic gốc:
-        - tìm điểm gần tâm nhất
-        - tìm điểm xa nhất khỏi điểm đó
-        - rồi tìm điểm xa nhất khỏi điểm vừa tìm
-        """
+        """Lay hai dau mut truc chinh de split ellipsoid."""
         if self._major_axis_endpoints is None:
             if self.n_samples <= 1:
                 self._major_axis_endpoints = (self.center, self.center)
@@ -208,10 +150,8 @@ class Ellipsoid:
     @property
     def density(self) -> float:
         """
-        Mật độ ellipsoid.
-
-        Kế thừa công thức gốc.
-        Phần mới: sử dụng Mahalanobis bằng Cholesky solve và cache kết quả.
+        Mat do ellipsoid theo cong thuc GE-DPC goc,
+        nhung Mahalanobis distance duoc tinh bang Cholesky solve.
         """
         if self._density is None:
             axes_sum = max(float(np.sum(self.lengths)), 1e-12)
@@ -222,29 +162,21 @@ class Ellipsoid:
 
 
 # ============================================================
-# Helper functions (kế thừa logic gốc)
+# Helper functions
 # ============================================================
 def get_num(ellipsoid: Ellipsoid) -> int:
-    """Kế thừa code gốc: trả về số điểm của ellipsoid."""
     return ellipsoid.n_samples
 
 
 def calculate_ellipsoid_density(ellipsoid: Ellipsoid) -> float:
-    """Kế thừa ý nghĩa gốc, nhưng tận dụng cache density."""
     return ellipsoid.density
 
 
 # ============================================================
-# Split stage
+# Split stage: kept from GE-DPC logic
 # ============================================================
 def splits(ellipsoid_list: Sequence[Ellipsoid], num: int, epsilon: float) -> List[Ellipsoid]:
-    """
-    Safe split cho toàn bộ danh sách ellipsoid.
-
-    Kế thừa logic gốc:
-    - Nếu ellipsoid có ít hơn num điểm thì giữ nguyên.
-    - Ngược lại thì thử tách bằng splits_ellipsoid.
-    """
+    """Safe split theo kich thuoc ellipsoid."""
     new_ells: List[Ellipsoid] = []
     for ell in ellipsoid_list:
         if get_num(ell) < num:
@@ -256,14 +188,9 @@ def splits(ellipsoid_list: Sequence[Ellipsoid], num: int, epsilon: float) -> Lis
 
 def splits_ellipsoid(ellipsoid: Ellipsoid, epsilon: Optional[float] = None) -> List[Ellipsoid]:
     """
-    Tách một ellipsoid thành hai ellipsoid con.
-
-    Kế thừa logic gốc gồm 2 pha:
-    1) Chia sơ bộ theo 2 đầu mút trục chính.
-    2) Gán lại mỗi điểm cho ellipsoid gần hơn theo Mahalanobis distance.
-
-    Phần mới:
-    - Pha 2 được vector hóa bằng mahal_sq_points(), không còn loop điểm + inv(H).
+    Tach mot ellipsoid thanh hai ellipsoid con.
+    Phase 1: chia theo hai dau mut truc chinh.
+    Phase 2: gan lai diem bang Mahalanobis distance.
     """
     if ellipsoid.n_samples <= 1:
         return [ellipsoid]
@@ -273,9 +200,6 @@ def splits_ellipsoid(ellipsoid: Ellipsoid, epsilon: Optional[float] = None) -> L
     indices = ellipsoid.indices
     point1, point2 = ellipsoid.major_axis_endpoints
 
-    # ------------------------------
-    # Phase 1: split sơ bộ theo khoảng cách Euclidean đến 2 đầu mút
-    # ------------------------------
     dist_to_point1 = np.linalg.norm(data - point1, axis=1)
     dist_to_point2 = np.linalg.norm(data - point2, axis=1)
 
@@ -293,9 +217,6 @@ def splits_ellipsoid(ellipsoid: Ellipsoid, epsilon: Optional[float] = None) -> L
     ell1 = Ellipsoid(cluster1, cluster1_idx, epsilon=eps)
     ell2 = Ellipsoid(cluster2, cluster2_idx, epsilon=eps)
 
-    # ------------------------------
-    # Phase 2: gán lại bằng Mahalanobis distance
-    # ------------------------------
     dist1_sq = ell1.mahal_sq_points(data)
     dist2_sq = ell2.mahal_sq_points(data)
     new_cluster1_mask = dist1_sq < dist2_sq
@@ -314,9 +235,6 @@ def splits_ellipsoid(ellipsoid: Ellipsoid, epsilon: Optional[float] = None) -> L
     return [ell1, ell2]
 
 
-# ============================================================
-# Outlier-detection split stage
-# ============================================================
 def recursive_split_outlier_detection(
     initial_ellipsoids: Sequence[Ellipsoid],
     data: np.ndarray,
@@ -325,11 +243,8 @@ def recursive_split_outlier_detection(
     epsilon: float = 1e-6,
 ) -> List[Ellipsoid]:
     """
-    Tách tiếp các ellipsoid ngoại lệ.
-
-    Kế thừa logic gốc:
-    - Một ellipsoid bị xem là ngoại lệ nếu tổng độ dài trục > 2 * trung bình.
-    - Chỉ chấp nhận split nếu tổng mật độ con đủ lớn hơn mật độ cha theo ngưỡng t.
+    Outlier-detection split.
+    Giu logic goc: chi split ellipsoid bat thuong neu tong density con du tot.
     """
     ellipsoid_list = list(initial_ellipsoids)
 
@@ -340,9 +255,7 @@ def recursive_split_outlier_detection(
         axes_sums = np.array([np.sum(ell.lengths) for ell in ellipsoid_list], dtype=float)
         axes_sum_avg = float(np.mean(axes_sums)) if len(axes_sums) > 0 else 0.0
 
-        outlier_ellipsoids = [
-            ell for ell in ellipsoid_list if np.sum(ell.lengths) > 2.0 * axes_sum_avg
-        ]
+        outlier_ellipsoids = [ell for ell in ellipsoid_list if np.sum(ell.lengths) > 2.0 * axes_sum_avg]
         if not outlier_ellipsoids:
             break
 
@@ -379,17 +292,8 @@ def recursive_split_outlier_detection(
 # ============================================================
 def ellipse_mahalanobis_distance(ellipsoid_i: Ellipsoid, ellipsoid_j: Ellipsoid) -> Tuple[float, float, float]:
     """
-    Khoảng cách giữa hai ellipsoid dựa trên tâm và average covariance.
-
-    Kế thừa logic gốc:
-    - avg_cov = (H_i + H_j) / 2
-    - đo Mahalanobis giữa hai tâm theo avg_cov
-
-    Phần mới:
-    - Không nghịch đảo avg_cov trực tiếp.
-    - Dùng Cholesky solve trên avg_cov.
-
-    Trả về 3 giá trị để giữ đúng giao diện cũ.
+    Distance giua hai ellipsoid dua tren tam va average H.
+    Dung Cholesky solve thay cho inverse.
     """
     center_i = ellipsoid_i.center
     center_j = ellipsoid_j.center
@@ -404,39 +308,23 @@ def ellipse_mahalanobis_distance(ellipsoid_i: Ellipsoid, ellipsoid_j: Ellipsoid)
 
 
 def ellipse_distance(ellipsoid_list: Sequence[Ellipsoid]) -> np.ndarray:
-    """
-    Tạo ma trận khoảng cách giữa các ellipsoid.
-
-    Kế thừa logic gốc:
-    - tính nửa trên ma trận rồi đối xứng xuống dưới
-
-    Phần mới:
-    - Có pair-cache cục bộ để tránh tính lặp trong cùng một lần gọi.
-    """
+    """Tao ma tran khoang cach giua cac ellipsoid."""
     n = len(ellipsoid_list)
     dist_mat = np.zeros((n, n), dtype=float)
-    pair_cache: Dict[Tuple[int, int], float] = {}
 
     for i in range(n):
         for j in range(i + 1, n):
-            key = (i, j)
-            if key not in pair_cache:
-                _, _, rel_dist = ellipse_mahalanobis_distance(ellipsoid_list[i], ellipsoid_list[j])
-                pair_cache[key] = rel_dist
-            dist_mat[i, j] = dist_mat[j, i] = pair_cache[key]
+            _, _, rel_dist = ellipse_mahalanobis_distance(ellipsoid_list[i], ellipsoid_list[j])
+            dist_mat[i, j] = dist_mat[j, i] = rel_dist
 
     return dist_mat
 
 
 # ============================================================
-# DPC attribute computation and clustering
+# DPC attributes
 # ============================================================
 def ellipse_min_dist(dist_mat: np.ndarray, densities: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Tính delta/min-distance tới ellipsoid có density cao hơn.
-
-    Kế thừa code gốc.
-    """
+    """Tinh delta/min-distance toi ellipsoid co density cao hon gan nhat."""
     densities = np.asarray(densities, dtype=float)
     order = np.argsort(-densities)
     min_dists = np.zeros(len(densities), dtype=float)
@@ -458,104 +346,301 @@ def ellipse_min_dist(dist_mat: np.ndarray, densities: np.ndarray) -> Tuple[np.nd
     return min_dists, nearest
 
 
-def auto_select_centers(
+def robust_scale(values: np.ndarray) -> np.ndarray:
+    """Scale ve [0, 1] bang min-max an toan."""
+    values = np.asarray(values, dtype=float)
+    v_min = float(np.min(values)) if values.size else 0.0
+    v_max = float(np.max(values)) if values.size else 1.0
+    return (values - v_min) / max(v_max - v_min, 1e-12)
+
+
+# ============================================================
+# Improved center selection
+# ============================================================
+def auto_select_centers_quality(
     densities: np.ndarray,
     min_dists: np.ndarray,
-    mode: str = "knee",
+    dist_mat: np.ndarray,
     top_k: Optional[int] = None,
-    min_centers: int = 1,
+    min_centers: int = 2,
     max_centers: Optional[int] = None,
 ) -> List[int]:
     """
-    Tự động chọn center theo gamma = density * delta.
+    Cai tien chon center.
 
-    Kế thừa logic gốc đầy đủ:
-    - top_k cố định
-    - threshold
-    - knee
+    Khac voi ban goc:
+    - Van dung gamma = density * delta.
+    - Neu top_k != None thi cho phep chay theo k biet truoc.
+    - Neu top_k == None thi tu dong chon ung vien bang gamma-gap/knee.
+    - Them redundancy pruning: loai center qua gan center da chon.
+
+    Muc tieu:
+    - Giam truong hop chon thieu center.
+    - Giam truong hop nhieu center nam cung mot vung mat do.
+    - Khong dung label that.
     """
     densities = np.asarray(densities, dtype=float)
     min_dists = np.asarray(min_dists, dtype=float)
     n = len(densities)
     if n == 0:
         return []
+    if n == 1:
+        return [0]
 
     gamma = densities * min_dists
     order = np.argsort(-gamma)
 
     if top_k is not None:
-        k = int(max(1, min(top_k, n)))
-        return order[:k].tolist()
-
-    if mode == "threshold":
-        g = gamma[order]
-        thr = np.mean(g) + np.std(g)
-        centers = order[g > thr].tolist()
-        if len(centers) < min_centers:
-            centers = order[:min_centers].tolist()
+        target_k = int(max(1, min(top_k, n)))
         if max_centers is not None:
-            centers = centers[:max_centers]
-        return centers
+            target_k = min(target_k, max_centers)
+        target_k = max(min_centers, target_k)
+        return order[: min(target_k, n)].tolist()
 
+    # ------------------------------
+    # 1) Tu dong uoc luong so center ung vien bang gamma drop.
+    # ------------------------------
     g = gamma[order]
-    if n == 1 or np.allclose(g, g[0]):
-        k = min_centers if max_centers is None else min(min_centers, max_centers)
-        return order[:k].tolist()
+    g_norm = robust_scale(g)
 
-    x = np.arange(n, dtype=float)
-    x_norm = x / max(n - 1, 1)
-    y_norm = (g - g.min()) / max(g.max() - g.min(), 1e-12)
-
-    p1 = np.array([x_norm[0], y_norm[0]], dtype=float)
-    p2 = np.array([x_norm[-1], y_norm[-1]], dtype=float)
-    line_vec = p2 - p1
-    line_norm = np.linalg.norm(line_vec)
-
-    if line_norm < 1e-12:
-        knee_idx = min_centers - 1
+    if np.allclose(g_norm, g_norm[0]):
+        candidate_k = min(max(min_centers, 1), n)
     else:
-        dists = [abs(np.cross(line_vec, np.array([xi, yi]) - p1)) / line_norm for xi, yi in zip(x_norm, y_norm)]
-        knee_idx = int(np.argmax(dists))
-
-    k = max(min_centers, knee_idx + 1)
-    if max_centers is not None:
-        k = min(k, max_centers)
-    return order[:min(k, n)].tolist()
-
-
-def ellipse_cluster(densities: np.ndarray, centers: Sequence[int], nearest: np.ndarray) -> np.ndarray:
-    """
-    Gán nhãn ellipsoid theo nguyên lý Density Peak Clustering.
-
-    Kế thừa logic gốc.
-    """
-    labels = -np.ones(len(densities), dtype=int)
-    for i, c in enumerate(centers):
-        labels[c] = i
-
-    order = np.argsort(-np.asarray(densities))
-    for idx in order:
-        if labels[idx] == -1 and nearest[idx] != -1:
-            labels[idx] = labels[nearest[idx]]
-
-    if np.any(labels == -1):
-        if len(centers) == 0:
-            labels[labels == -1] = 0
+        # Ratio drop giua cac gamma lien tiep.
+        drops = (g_norm[:-1] - g_norm[1:]) / np.maximum(g_norm[:-1], 1e-12)
+        if drops.size == 0:
+            candidate_k = min_centers
         else:
-            labels[labels == -1] = len(centers)
+            # Vi tri drop lon nhat trong phan dau danh sach.
+            head_limit = max(min(n - 1, int(np.ceil(np.sqrt(n))) + min_centers), min_centers)
+            head_drops = drops[:head_limit]
+            candidate_k = int(np.argmax(head_drops)) + 1
+            candidate_k = max(candidate_k, min_centers)
+
+    # Lay du ung vien de redundancy pruning co co hoi chon center tot.
+    pool_size = max(candidate_k * 3, min_centers * 3, int(np.ceil(np.sqrt(n))))
+    if max_centers is not None:
+        pool_size = max(pool_size, max_centers)
+    pool_size = min(pool_size, n)
+    pool = order[:pool_size]
+
+    # ------------------------------
+    # 2) Redundancy pruning tu dong bang median positive distance.
+    # ------------------------------
+    positive_dists = dist_mat[dist_mat > 0]
+    if positive_dists.size == 0:
+        return order[:max(min_centers, 1)].tolist()
+
+    median_dist = float(np.median(positive_dists))
+    q25_dist = float(np.quantile(positive_dists, 0.25))
+    # min_sep khong phai tham so thu cong: suy ra tu phan bo distance.
+    min_sep = max(q25_dist, 0.25 * median_dist, 1e-12)
+
+    selected: List[int] = []
+    for idx in pool:
+        if not selected:
+            selected.append(int(idx))
+        else:
+            nearest_selected_dist = float(np.min(dist_mat[idx, selected]))
+            if nearest_selected_dist >= min_sep:
+                selected.append(int(idx))
+
+        if max_centers is not None and len(selected) >= max_centers:
+            break
+
+    # Neu pruning qua manh thi bo sung theo gamma cao nhat.
+    if len(selected) < min_centers:
+        for idx in order:
+            if int(idx) not in selected:
+                selected.append(int(idx))
+            if len(selected) >= min_centers:
+                break
+
+    if max_centers is not None:
+        selected = selected[:max_centers]
+
+    return selected
+
+
+# ============================================================
+# Graph-based multi-neighbor propagation
+# ============================================================
+def ellipse_cluster_graph_propagation(
+    densities: np.ndarray,
+    dist_mat: np.ndarray,
+    centers: Sequence[int],
+) -> np.ndarray:
+    """
+    Graph-based multi-neighbor label propagation o muc ellipsoid.
+
+    Khac voi ellipse_cluster() goc:
+    - Goc: moi ellipsoid nhan nhan tu 1 nearest higher-density neighbor.
+    - Moi: moi ellipsoid nhan vote tu nhieu higher-density neighbors da co nhan.
+
+    Cach tinh vote:
+        vote(label_j) += density_j / distance(i, j)
+
+    Uu diem:
+    - Giam loi lan truyen theo chuoi don.
+    - Tang on dinh khi center hoac nearest higher-density bi lech.
+    - Chi xu ly tren so ellipsoid nen chi phi nho.
+    """
+    densities = np.asarray(densities, dtype=float)
+    n = len(densities)
+    labels = -np.ones(n, dtype=int)
+
+    centers = [int(c) for c in centers if 0 <= int(c) < n]
+    if len(centers) == 0:
+        labels[:] = 0
+        return labels
+
+    for label_id, c in enumerate(centers):
+        labels[c] = label_id
+
+    order = np.argsort(-densities)
+    positive_dists = dist_mat[dist_mat > 0]
+    eps_dist = float(np.median(positive_dists) * 1e-9) if positive_dists.size else 1e-12
+
+    # So neighbor noi bo, suy ra tu so ellipsoid, khong yeu cau nguoi dung tune.
+    k_neighbors = max(2, int(np.ceil(np.log2(max(n, 2)))))
+
+    for idx in order:
+        if labels[idx] != -1:
+            continue
+
+        higher = np.where(densities > densities[idx])[0]
+        if higher.size == 0:
+            # Fallback: gan ve center gan nhat.
+            nearest_center = centers[int(np.argmin(dist_mat[idx, centers]))]
+            labels[idx] = labels[nearest_center]
+            continue
+
+        # Chi lay higher-density neighbors gan nhat.
+        higher_sorted = higher[np.argsort(dist_mat[idx, higher])]
+        higher_sorted = higher_sorted[: min(k_neighbors, higher_sorted.size)]
+
+        votes: Dict[int, float] = {}
+        for nb in higher_sorted:
+            nb_label = int(labels[nb])
+            if nb_label == -1:
+                continue
+            w = float(densities[nb] / (dist_mat[idx, nb] + eps_dist))
+            votes[nb_label] = votes.get(nb_label, 0.0) + w
+
+        if votes:
+            labels[idx] = max(votes.items(), key=lambda kv: kv[1])[0]
+        else:
+            # Neu chua co higher neighbor nao da co nhan, fallback ve center gan nhat.
+            nearest_center = centers[int(np.argmin(dist_mat[idx, centers]))]
+            labels[idx] = labels[nearest_center]
+
+    # Fallback cuoi cung neu con ellipsoid chua co nhan.
+    unlabeled = np.where(labels == -1)[0]
+    for idx in unlabeled:
+        nearest_center = centers[int(np.argmin(dist_mat[idx, centers]))]
+        labels[idx] = labels[nearest_center]
 
     return labels
+
+
+# ============================================================
+# Light cluster merge
+# ============================================================
+def merge_close_clusters_light(
+    ellipsoid_labels: np.ndarray,
+    centers: Sequence[int],
+    densities: np.ndarray,
+    dist_mat: np.ndarray,
+) -> np.ndarray:
+    """
+    Merge cum nhe neu center bi chon du.
+
+    Nguyen tac bao thu:
+    - Chi merge khi hai cluster-center rat gan nhau theo phan bo distance center-center.
+    - Khong dung label that.
+    - Dung DSU/Union-Find de hop nhat label.
+
+    Muc tieu:
+    - Neu center selection chon du center trong cung mot vung mat do,
+      buoc nay gom lai de giam over-segmentation.
+    - Neu cac center cach xa nhau, buoc nay gan nhu khong anh huong.
+    """
+    labels = np.asarray(ellipsoid_labels, dtype=int).copy()
+    unique_labels = sorted([int(x) for x in np.unique(labels) if x >= 0])
+    if len(unique_labels) <= 1:
+        return labels
+
+    # Dai dien moi cum: ellipsoid co density cao nhat trong cum.
+    representatives: Dict[int, int] = {}
+    for lab in unique_labels:
+        members = np.where(labels == lab)[0]
+        if members.size == 0:
+            continue
+        representatives[lab] = int(members[np.argmax(densities[members])])
+
+    reps = list(representatives.values())
+    if len(reps) <= 1:
+        return labels
+
+    center_dists = []
+    for a in range(len(reps)):
+        for b in range(a + 1, len(reps)):
+            d = float(dist_mat[reps[a], reps[b]])
+            if d > 0:
+                center_dists.append(d)
+
+    if len(center_dists) == 0:
+        return labels
+
+    center_dists = np.asarray(center_dists, dtype=float)
+    merge_threshold = float(np.quantile(center_dists, 0.20))
+    if merge_threshold <= 0:
+        return labels
+
+    parent = {lab: lab for lab in unique_labels}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            # Giu root la cluster co representative density cao hon.
+            rep_a = representatives[ra]
+            rep_b = representatives[rb]
+            if densities[rep_a] >= densities[rep_b]:
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+    # Merge bao thu: chi merge cac representative rat gan nhau.
+    for i, lab_i in enumerate(unique_labels):
+        for lab_j in unique_labels[i + 1:]:
+            rep_i = representatives[lab_i]
+            rep_j = representatives[lab_j]
+            d = float(dist_mat[rep_i, rep_j])
+            if 0 < d <= merge_threshold:
+                union(lab_i, lab_j)
+
+    merged = labels.copy()
+    for lab in unique_labels:
+        merged[labels == lab] = find(lab)
+
+    # Nen lai label ve 0..k-1.
+    final_unique = sorted(np.unique(merged))
+    remap = {old: new for new, old in enumerate(final_unique)}
+    merged = np.array([remap[x] for x in merged], dtype=int)
+    return merged
 
 
 # ============================================================
 # Evaluation
 # ============================================================
 def align_labels(true_labels: np.ndarray, pred_labels: np.ndarray) -> np.ndarray:
-    """
-    Hungarian matching để căn chỉnh nhãn dự đoán với nhãn thật.
-
-    Kế thừa code gốc.
-    """
+    """Hungarian matching de tinh ACC cho clustering."""
     true_classes = np.unique(true_labels)
     pred_classes = np.unique(pred_labels)
 
@@ -570,36 +655,52 @@ def align_labels(true_labels: np.ndarray, pred_labels: np.ndarray) -> np.ndarray
 
 
 # ============================================================
-# Main GE-DPC pipeline
+# Main improved GE-DPC pipeline
 # ============================================================
-def run_ge_dpc_cholesky_cache(
+def run_ge_dpc_cholesky_graph_quality(
     feature_file: Path,
     label_file: Path,
     epsilon: float = 1e-6,
     outlier_t: float = 2.0,
-    auto_center_mode: str = "knee",
     auto_center_k: Optional[int] = None,
-    min_centers: int = 1,
+    min_centers: int = 2,
     max_centers: Optional[int] = None,
+    enable_light_merge: bool = True,
 ) -> Dict[str, object]:
     """
-    Pipeline hoàn chỉnh GE-DPC dùng Cholesky + cache.
+    Pipeline GE-DPC cai tien chat luong.
 
-    Kế thừa cấu trúc code gốc gần như toàn bộ.
-    Phần mới chỉ nằm ở cách xử lý ma trận và cache.
+    Buoc 1. Doc du lieu va nhan that.
+    Buoc 2. Sinh granular-ellipsoid.
+    Buoc 3. Toi uu tinh toan hinh hoc bang Cholesky/cache.
+    Buoc 4. Tinh DPC attributes o muc ellipsoid.
+    Buoc 5. Cai tien chon center.
+    Buoc 6. Gan nhan bang graph-based multi-neighbor propagation.
+    Buoc 7. Merge cum nhe neu chon du center.
+    Buoc 8. Anh xa nhan ellipsoid ve diem du lieu.
+    Buoc 9. Danh gia ACC/NMI/ARI va thoi gian chay.
     """
     data = np.loadtxt(feature_file, dtype=float)
     true_labels = np.loadtxt(label_file, dtype=float).astype(int)
+
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+
     num = int(np.ceil(np.sqrt(data.shape[0])))
 
     # ------------------------------
-    # 1) Sinh ellipsoid
+    # 1-2) Sinh ellipsoid
     # ------------------------------
     t_gen_start = time.time()
     initial_indices = np.arange(data.shape[0], dtype=int)
     initial_ellipsoid = Ellipsoid(data, initial_indices, epsilon=epsilon)
     ellipsoid_list: List[Ellipsoid] = [initial_ellipsoid]
-    print("Initial ellipsoid count (Số lượng ellipsoid ban đầu): 1")
+
+    print("=" * 80)
+    print("GE-DPC Cholesky + Graph Quality Improvement")
+    print(f"Data shape: n={data.shape[0]}, d={data.shape[1]}")
+    print(f"Safe split threshold num = ceil(sqrt(n)) = {num}")
+    print("Initial ellipsoid count (So luong ellipsoid ban dau): 1")
 
     iteration = 0
     while True:
@@ -607,17 +708,11 @@ def run_ge_dpc_cholesky_cache(
         before = len(ellipsoid_list)
         ellipsoid_list = splits(ellipsoid_list, num=num, epsilon=epsilon)
         after = len(ellipsoid_list)
-        print(
-            f"Ellipsoid count after safe split iteration {iteration} "
-            f"(Số lượng ellipsoid sau lần phân tách an toàn thứ {iteration}): {after}"
-        )
+        print(f"Ellipsoid count after safe split iteration {iteration}: {after}")
         if after == before:
             break
 
-    print(
-        f"Total ellipsoid count after safe splitting "
-        f"(Tổng số ellipsoid sau phân tách an toàn): {len(ellipsoid_list)}"
-    )
+    print(f"Total ellipsoid count after safe splitting: {len(ellipsoid_list)}")
 
     ellipsoid_list = recursive_split_outlier_detection(
         ellipsoid_list,
@@ -626,57 +721,68 @@ def run_ge_dpc_cholesky_cache(
         max_iterations=10,
         epsilon=epsilon,
     )
-    print(
-        f"Total ellipsoid count after outlier-detection splitting "
-        f"(Tổng số ellipsoid sau phân tách bằng phát hiện ngoại lệ): {len(ellipsoid_list)}"
-    )
-    print(f"A total of {len(ellipsoid_list)} ellipsoids were generated (Tổng cộng đã tạo {len(ellipsoid_list)} ellipsoid)")
+    print(f"Total ellipsoid count after outlier-detection splitting: {len(ellipsoid_list)}")
     t_gen_end = time.time()
     time_gen = t_gen_end - t_gen_start
 
     # ------------------------------
-    # 2) Tính attributes cho DPC
+    # 3-4) DPC attributes
     # ------------------------------
     t_attr_start = time.time()
     densities = np.array([calculate_ellipsoid_density(ell) for ell in ellipsoid_list], dtype=float)
     dist_matrix = ellipse_distance(ellipsoid_list)
     min_dists, nearest = ellipse_min_dist(dist_matrix, densities)
-
-    axes_sums = [np.sum(ell.lengths) for ell in ellipsoid_list]
-    axes_sum_avg = np.mean(axes_sums) if axes_sums else 0.0
-    outlier_ellipsoids = [ell for ell in ellipsoid_list if np.sum(ell.lengths) > 2 * axes_sum_avg]
-    print(f"Number of outlier ellipsoids (Số lượng ellipsoid ngoại lệ): {len(outlier_ellipsoids)}")
+    gamma = densities * min_dists
     t_attr_end = time.time()
     time_attr = t_attr_end - t_attr_start
 
     # ------------------------------
-    # 3) Chọn center
+    # 5) Improved center selection
     # ------------------------------
-    print("Auto-selecting cluster centers from decision values (Tự động chọn tâm cụm từ các giá trị decision)...")
-    selected = auto_select_centers(
-        densities,
-        min_dists,
-        mode=auto_center_mode,
+    print("Auto-selecting cluster centers with quality-aware redundancy pruning...")
+    selected = auto_select_centers_quality(
+        densities=densities,
+        min_dists=min_dists,
+        dist_mat=dist_matrix,
         top_k=auto_center_k,
         min_centers=min_centers,
         max_centers=max_centers,
     )
-    gamma = densities * min_dists
-    print(f"Selected cluster centers (Các tâm cụm đã chọn): {selected}")
-    print(f"Selected gamma values (Giá trị gamma của các tâm cụm): {[float(gamma[i]) for i in selected]}")
+    print(f"Selected centers: {selected}")
+    print(f"Selected gamma values: {[float(gamma[i]) for i in selected]}")
 
     # ------------------------------
-    # 4) Phân cụm ellipsoid
+    # 6-7) Graph propagation + light merge
     # ------------------------------
     t_cluster_start = time.time()
-    ellipsoid_labels = ellipse_cluster(densities, selected, nearest)
+    ellipsoid_labels_before_merge = ellipse_cluster_graph_propagation(
+        densities=densities,
+        dist_mat=dist_matrix,
+        centers=selected,
+    )
+
+    if enable_light_merge:
+        ellipsoid_labels = merge_close_clusters_light(
+            ellipsoid_labels=ellipsoid_labels_before_merge,
+            centers=selected,
+            densities=densities,
+            dist_mat=dist_matrix,
+        )
+    else:
+        ellipsoid_labels = ellipsoid_labels_before_merge
+
     t_cluster_end = time.time()
     time_cluster = t_cluster_end - t_cluster_start
 
+    n_clusters_before = len(np.unique(ellipsoid_labels_before_merge))
+    n_clusters_after = len(np.unique(ellipsoid_labels))
+    print(f"Clusters before light merge: {n_clusters_before}")
+    print(f"Clusters after light merge : {n_clusters_after}")
+
     # ------------------------------
-    # 5) Ánh xạ nhãn ellipsoid -> điểm dữ liệu
+    # 8) Mapping ellipsoid label -> data point label
     # ------------------------------
-    print("Mapping data points in progress (Đang ánh xạ điểm dữ liệu, không tính vào thời gian phân cụm)...")
+    print("Mapping ellipsoid labels to data points...")
     pred_labels = np.full(len(data), -1, dtype=int)
     for i, ell in enumerate(ellipsoid_list):
         pred_labels[ell.indices] = ellipsoid_labels[i]
@@ -685,37 +791,29 @@ def run_ge_dpc_cholesky_cache(
         raise RuntimeError("Some data points were not assigned a cluster label.")
 
     # ------------------------------
-    # 6) Đánh giá
+    # 9) Evaluation
     # ------------------------------
-    print("Calculating evaluation metrics (Đang tính các chỉ số đánh giá)...")
     aligned_pred_labels = align_labels(true_labels, pred_labels)
     acc = accuracy_score(true_labels, aligned_pred_labels)
     nmi = normalized_mutual_info_score(true_labels, pred_labels)
     ari = adjusted_rand_score(true_labels, pred_labels)
 
+    total_valid_time1 = time_attr + time_cluster
+    total_valid_time2 = time_gen + time_attr + time_cluster
+
+    print("-" * 80)
+    print("Evaluation metrics:")
     print(f"ACC: {acc:.3f}")
     print(f"NMI: {nmi:.3f}")
     print(f"ARI: {ari:.3f}")
-    print("-" * 30)
-    print("Runtime statistics details (Chi tiết thống kê thời gian chạy):")
-    print(f"1. Ellipsoid generation time (Thời gian tạo ellipsoid): {time_gen:.14f} seconds (giây)")
-    print(f"2. Attribute computation time (Thời gian tính thuộc tính): {time_attr:.14f} seconds (giây)")
-    print(
-        f"3. Clustering computation time (Thời gian tính phân cụm): {time_cluster:.14f} seconds (giây) "
-        f"(mapping time excluded / không tính thời gian ánh xạ)"
-    )
-    total_valid_time1 = time_attr + time_cluster
-    total_valid_time2 = time_gen + time_attr + time_cluster
-    print("-" * 30)
-    print(
-        f"Total effective runtime (attributes + clustering) "
-        f"(Tổng thời gian hiệu dụng: thuộc tính + phân cụm): {total_valid_time1:.14f} seconds (giây)"
-    )
-    print(
-        f"Total effective runtime of the program "
-        f"(Tổng thời gian chạy hiệu dụng của chương trình): {total_valid_time2:.14f} seconds (giây)"
-    )
-    print("-" * 30)
+    print("-" * 80)
+    print("Runtime statistics:")
+    print(f"1. Ellipsoid generation time: {time_gen:.14f} seconds")
+    print(f"2. Attribute computation time: {time_attr:.14f} seconds")
+    print(f"3. Clustering computation time: {time_cluster:.14f} seconds")
+    print(f"Total effective runtime (attributes + clustering): {total_valid_time1:.14f} seconds")
+    print(f"Total effective runtime of the program: {total_valid_time2:.14f} seconds")
+    print("-" * 80)
 
     return {
         "acc": acc,
@@ -723,6 +821,8 @@ def run_ge_dpc_cholesky_cache(
         "ari": ari,
         "selected_centers": selected,
         "n_ellipsoids": len(ellipsoid_list),
+        "n_clusters_before_merge": n_clusters_before,
+        "n_clusters_after_merge": n_clusters_after,
         "pred_labels": pred_labels,
         "aligned_pred_labels": aligned_pred_labels,
         "generation_time": time_gen,
@@ -734,14 +834,13 @@ def run_ge_dpc_cholesky_cache(
 
 
 # ============================================================
-# Dataset registry for the 8 datasets referenced by the original code
-# ------------------------------------------------------------
-# Ghi chú:
-# - 7 bộ nằm trong real_dataset_and_label
-# - 1 bộ miniboone nằm trong data/miniboone
-# - Hàm này giúp bạn chạy lần lượt 8 bộ theo cùng một source code
+# Dataset registry
 # ============================================================
 def get_default_dataset_registry(base_dir: Path) -> Dict[str, Tuple[Path, Path]]:
+    """
+    Registry giu nguyen tu source cua ban.
+    Neu dataset nao khong ton tai, run_all_default_datasets() se bo qua va bao loi.
+    """
     return {
         "miniboone": (
             base_dir / "data" / "miniboone" / "miniboone.txt",
@@ -807,14 +906,12 @@ def run_named_dataset(
     base_dir: Path,
     epsilon: float = 1e-6,
     outlier_t: float = 2.0,
-    auto_center_mode: str = "knee",
     auto_center_k: Optional[int] = None,
-    min_centers: int = 1,
+    min_centers: int = 2,
     max_centers: Optional[int] = None,
+    enable_light_merge: bool = True,
 ) -> Dict[str, object]:
-    """
-    Chạy một dataset theo tên trong registry mặc định.
-    """
+    """Chay mot dataset theo ten."""
     registry = get_default_dataset_registry(base_dir)
     key = dataset_name.lower()
     if key not in registry:
@@ -833,101 +930,117 @@ def run_named_dataset(
     print(f"Label file  : {label_file}")
     print("=" * 80)
 
-    return run_ge_dpc_cholesky_cache(
+    return run_ge_dpc_cholesky_graph_quality(
         feature_file=feature_file,
         label_file=label_file,
         epsilon=epsilon,
         outlier_t=outlier_t,
-        auto_center_mode=auto_center_mode,
         auto_center_k=auto_center_k,
         min_centers=min_centers,
         max_centers=max_centers,
+        enable_light_merge=enable_light_merge,
     )
 
 
 def run_all_default_datasets(
     base_dir: Path,
+    dataset_names: Optional[Sequence[str]] = None,
     epsilon: float = 1e-6,
     outlier_t: float = 2.0,
-    auto_center_mode: str = "knee",
     auto_center_k: Optional[int] = None,
-    min_centers: int = 1,
+    min_centers: int = 2,
     max_centers: Optional[int] = None,
+    enable_light_merge: bool = True,
 ) -> Dict[str, Dict[str, object]]:
-    """
-    Chạy toàn bộ 8 dataset trong registry mặc định.
-
-    Ghi chú:
-    - Hàm này không ép bạn phải dùng cùng một top-k cho mọi dataset.
-    - Nhưng để bám đúng source gốc hiện tại của bạn, nó giữ đúng một giao diện thống nhất.
-    """
-    results: Dict[str, Dict[str, object]] = {}
+    """Chay nhieu dataset va in bang tong hop."""
     registry = get_default_dataset_registry(base_dir)
+    if dataset_names is None:
+        dataset_names = list(registry.keys())
 
-    for dataset_name in registry.keys():
+    results: Dict[str, Dict[str, object]] = {}
+
+    for dataset_name in dataset_names:
         try:
             results[dataset_name] = run_named_dataset(
                 dataset_name=dataset_name,
                 base_dir=base_dir,
                 epsilon=epsilon,
                 outlier_t=outlier_t,
-                auto_center_mode=auto_center_mode,
                 auto_center_k=auto_center_k,
                 min_centers=min_centers,
                 max_centers=max_centers,
+                enable_light_merge=enable_light_merge,
             )
         except Exception as exc:
             results[dataset_name] = {"error": str(exc)}
             print(f"[ERROR] Dataset '{dataset_name}' failed: {exc}")
 
+    print("\n" + "=" * 100)
+    print("SUMMARY")
+    print("=" * 100)
+    print(f"{'Dataset':<18} {'ACC':>8} {'NMI':>8} {'ARI':>8} {'Ells':>8} {'C_before':>10} {'C_after':>9} {'Time(s)':>12}")
+    print("-" * 100)
+    for name, res in results.items():
+        if "error" in res:
+            print(f"{name:<18} ERROR: {res['error']}")
+        else:
+            print(
+                f"{name:<18} "
+                f"{res['acc']:>8.3f} "
+                f"{res['nmi']:>8.3f} "
+                f"{res['ari']:>8.3f} "
+                f"{res['n_ellipsoids']:>8} "
+                f"{res['n_clusters_before_merge']:>10} "
+                f"{res['n_clusters_after_merge']:>9} "
+                f"{res['total_valid_time_program']:>12.6f}"
+            )
+    print("=" * 100)
+
     return results
 
 
 if __name__ == "__main__":
-    # BASE_DIR = Path(__file__).resolve().parent
+    # Neu file nam trong GE-DPC-main/scripts thi dung parent.parent.
+    # Neu file nam truc tiep trong GE-DPC-main thi doi thanh Path(__file__).resolve().parent.
     BASE_DIR = Path(__file__).resolve().parent.parent
 
-    # ========================================================
-    # Algorithm settings
-    # --------------------------------------------------------
-    # Kế thừa từ code gốc:
-    # - epsilon và outlier_t giữ nguyên tinh thần paper/source gốc
-    # - center selection vẫn giữ nguyên giao diện cũ
-    # ========================================================
     epsilon = 1e-6
     outlier_t = 2.0
 
-    auto_center_mode = "knee" #Tham số sẽ thay đổi theo từng tập data để chọn center
-    auto_center_k = 2
+    # Khuyen nghi:
+    # - auto_center_k=None de tu dong chon center.
+    # - min_centers co the dat theo kien thuc dataset neu biet so lop toi thieu.
+    # - max_centers=None de khong ep cung; light merge se gom neu chon du.
+    auto_center_k = None
     min_centers = 2
-    max_centers = 2
+    max_centers = None
+    enable_light_merge = False
 
-    # --------------------------------------------------------
-    # Chọn 1 dataset để chạy
-    # --------------------------------------------------------
+    # Chay mot dataset.
     dataset_name = "segment_3"
-
     run_named_dataset(
         dataset_name=dataset_name,
         base_dir=BASE_DIR,
         epsilon=epsilon,
         outlier_t=outlier_t,
-        auto_center_mode=auto_center_mode,
         auto_center_k=auto_center_k,
         min_centers=min_centers,
         max_centers=max_centers,
+        enable_light_merge=enable_light_merge,
     )
 
-    # --------------------------------------------------------
-    # Nếu muốn chạy cả 8 bộ mặc định thì bỏ comment đoạn dưới
-    # --------------------------------------------------------
+    # Chay 8 dataset ban hay dung thi sua danh sach nay cho dung bo can chay.
+    # dataset_names = [
+    #     "iris", "seed", "segment_3", "landsat_2",
+    #     "msplice_2", "rice", "banknote", "htru2",
+    # ]
     # all_results = run_all_default_datasets(
     #     base_dir=BASE_DIR,
+    #     dataset_names=dataset_names,
     #     epsilon=epsilon,
     #     outlier_t=outlier_t,
-    #     auto_center_mode=auto_center_mode,
     #     auto_center_k=auto_center_k,
     #     min_centers=min_centers,
     #     max_centers=max_centers,
+    #     enable_light_merge=enable_light_merge,
     # )
-    # print(all_results)

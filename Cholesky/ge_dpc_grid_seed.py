@@ -1129,7 +1129,7 @@ if __name__ == "__main__":
     target_points_per_cell = 16
     adjacency_radius = 1
 
-    dataset_name = "miniboone"
+    dataset_name = "landsat_2"
 
     run_named_dataset(
         dataset_name=dataset_name,
