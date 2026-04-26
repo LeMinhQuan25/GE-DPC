@@ -898,14 +898,14 @@ if __name__ == "__main__":
     outlier_t = 2.0
 
     auto_center_mode = "knee" #Tham số sẽ thay đổi theo từng tập data để chọn center
-    auto_center_k = 2
-    min_centers = 2
-    max_centers = 2
+    auto_center_k = 3
+    min_centers = 3
+    max_centers = 3
 
     # --------------------------------------------------------
     # Chọn 1 dataset để chạy
     # --------------------------------------------------------
-    dataset_name = "segment_3"
+    dataset_name = "iris"
 
     run_named_dataset(
         dataset_name=dataset_name,

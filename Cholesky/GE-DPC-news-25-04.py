@@ -864,11 +864,16 @@ def run_ge_dpc_cholesky_conservative_quality(
     print(f"ARI: {ari:.3f}")
     print("-" * 80)
     print("Runtime statistics:")
-    print(f"1. Ellipsoid generation time: {time_gen:.14f} seconds")
-    print(f"2. Attribute computation time: {time_attr:.14f} seconds")
-    print(f"3. Clustering computation time: {time_cluster:.14f} seconds")
-    print(f"Total effective runtime (attributes + clustering): {total_valid_time1:.14f} seconds")
-    print(f"Total effective runtime of the program: {total_valid_time2:.14f} seconds")
+    # print(f"1. Ellipsoid generation time: {time_gen:.14f} seconds")
+    # print(f"2. Attribute computation time: {time_attr:.14f} seconds")
+    # print(f"3. Clustering computation time: {time_cluster:.14f} seconds")
+    # print(f"Total effective runtime (attributes + clustering): {total_valid_time1:.14f} seconds")
+    # print(f"Total effective runtime of the program: {total_valid_time2:.14f} seconds")
+    print(f"1. Ellipsoid generation time: {time_gen * 1000:.6f} ms")
+    print(f"2. Attribute computation time: {time_attr * 1000:.6f} ms")
+    print(f"3. Clustering computation time: {time_cluster * 1000:.6f} ms")
+    print(f"Total effective runtime (attributes + clustering): {total_valid_time1 * 1000:.6f} ms")
+    print(f"Total effective runtime of the program: {total_valid_time2 * 1000:.6f} ms")
     print("-" * 80)
 
     return {
@@ -1103,11 +1108,11 @@ if __name__ == "__main__":
     # min_centers = auto_center_k
     # max_centers = auto_center_k
     # enable_light_merge = False
-    dataset_name = "seed"
+    dataset_name = "hcv_data"
 
-    auto_center_k = 3
-    min_centers = 3
-    max_centers = 3
+    auto_center_k = 2
+    min_centers = 2
+    max_centers = 2
     enable_light_merge = False
 
     run_named_dataset(
