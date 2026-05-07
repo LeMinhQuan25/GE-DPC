@@ -1,27 +1,25 @@
 """
-GE-DPC Adaptive Quality Gate Final Version
-====================================
-
+GE-DPC Adaptive Quality Version
+===============================
 Pipeline:
 1) Raw data
-2) Adaptive scaler, not global scaler
-3) Generate granular ellipsoids with safe split + distance gate
+2) Adaptive scaler
+3) Generate granular ellipsoids
 4) Cholesky + cache for Mahalanobis distance
 5) Compute density, delta, gamma
-6) Center selection + distance pruning
-7) Try small k candidates if needed
-8) Label:
-   - run DPC single-chain
-   - run conservative graph correction
-   - choose better one by internal score
-9) Reject bad configurations if cluster distribution is too imbalanced
+6) Try multiple k candidates
+7) Label by DPC single-chain
+8) Use graph correction only if safe
+9) Select best configuration by internal score
 10) Map ellipsoid labels back to data points
-11) Evaluate ACC/NMI/ARI
+11) Draw clustering chart
+12) Evaluate ACC/NMI/ARI
 
-Important:
-- Ground-truth labels are used only for final evaluation.
-- Internal score does not use ground-truth labels.
+Notes:
+- Ground-truth labels are used only at the final evaluation step.
+- Internal score does NOT use ground-truth labels.
 - Cholesky + cache is kept as the speed-up core.
+- The plotting function is only for visualization and does not affect clustering logic.
 """
 
 import time
@@ -36,22 +34,32 @@ from sklearn.metrics import accuracy_score, adjusted_rand_score, normalized_mutu
 
 
 # ============================================================
-# Ellipsoid with Cholesky + Cache
+# Ablation switches
+# ============================================================
+# These flags are changed by run_ge_dpc_adaptive_quality() for each ablation variant.
+USE_QUALITY_GATE = True
+USE_DISTANCE_GATE = True
+USE_CHOLESKY = True
+USE_CACHE = True
+
+
+def set_ablation_switches(
+    use_quality_gate: bool = True,
+    use_distance_gate: bool = True,
+    use_cholesky: bool = True,
+    use_cache: bool = True,
+) -> None:
+    global USE_QUALITY_GATE, USE_DISTANCE_GATE, USE_CHOLESKY, USE_CACHE
+    USE_QUALITY_GATE = bool(use_quality_gate)
+    USE_DISTANCE_GATE = bool(use_distance_gate)
+    USE_CHOLESKY = bool(use_cholesky)
+    USE_CACHE = bool(use_cache)
+
+
+# ============================================================
+# Ellipsoid with optional Cholesky + optional Cache
 # ============================================================
 class Ellipsoid:
-    """
-    Granular ellipsoid.
-
-    Kept from GE-DPC:
-    - each ellipsoid stores points, center, covariance, shape matrix H,
-      rho, axis lengths, and split endpoints.
-
-    Improved:
-    - no direct inverse of H
-    - use Cholesky factorization + solve
-    - cache covariance, H, Cholesky factor, rho, axis lengths, density
-    """
-
     def __init__(self, data: np.ndarray, indices: np.ndarray, epsilon: float = 1e-6):
         self.data = np.asarray(data, dtype=float)
         self.indices = np.asarray(indices, dtype=int)
@@ -63,90 +71,115 @@ class Ellipsoid:
         self.n_samples, self.dim = self.data.shape
         self.center = np.mean(self.data, axis=0)
 
-        self._cov_matrix: Optional[np.ndarray] = None
-        self._H_matrix: Optional[np.ndarray] = None
+        self._cov_matrix = None
+        self._H_matrix = None
         self._chol_factor = None
-        self._rho: Optional[float] = None
+        self._rho = None
         self._lengths_rotation = None
         self._major_axis_endpoints = None
-        self._density: Optional[float] = None
+        self._density = None
+
+    def _compute_cov_matrix(self) -> np.ndarray:
+        if self.n_samples <= 1:
+            return np.zeros((self.dim, self.dim), dtype=float)
+        return np.cov(self.data.T, bias=True)
 
     @property
     def cov_matrix(self) -> np.ndarray:
+        if not USE_CACHE:
+            return self._compute_cov_matrix()
         if self._cov_matrix is None:
-            if self.n_samples <= 1:
-                self._cov_matrix = np.zeros((self.dim, self.dim), dtype=float)
-            else:
-                self._cov_matrix = np.cov(self.data.T, bias=True)
+            self._cov_matrix = self._compute_cov_matrix()
         return self._cov_matrix
 
     @property
     def H_matrix(self) -> np.ndarray:
+        if not USE_CACHE:
+            return self.cov_matrix + self.epsilon * np.eye(self.dim, dtype=float)
         if self._H_matrix is None:
             self._H_matrix = self.cov_matrix + self.epsilon * np.eye(self.dim, dtype=float)
         return self._H_matrix
 
     @property
     def chol_factor(self):
+        if not USE_CACHE:
+            return cho_factor(self.H_matrix, lower=True, check_finite=False)
         if self._chol_factor is None:
             self._chol_factor = cho_factor(self.H_matrix, lower=True, check_finite=False)
         return self._chol_factor
 
     def solve_H(self, rhs: np.ndarray) -> np.ndarray:
-        return cho_solve(self.chol_factor, rhs, check_finite=False)
+        if USE_CHOLESKY:
+            return cho_solve(self.chol_factor, rhs, check_finite=False)
+        # Direct inverse/pseudo-inverse version for ablation.
+        return np.linalg.pinv(self.H_matrix) @ rhs
 
     def mahal_sq_points(self, points: np.ndarray) -> np.ndarray:
         X = np.asarray(points, dtype=float)
         if X.ndim == 1:
             X = X[None, :]
-
         diffs = X - self.center
         solved = self.solve_H(diffs.T).T
         return np.maximum(np.einsum("ij,ij->i", diffs, solved), 0.0)
 
+    def _compute_rho(self) -> float:
+        return float(np.sqrt(np.max(self.mahal_sq_points(self.data))))
+
     @property
     def rho(self) -> float:
+        if not USE_CACHE:
+            return self._compute_rho()
         if self._rho is None:
-            self._rho = float(np.sqrt(np.max(self.mahal_sq_points(self.data))))
+            self._rho = self._compute_rho()
         return self._rho
+
+    def _compute_lengths_rotation(self):
+        eigvals_H, eigvecs_H = np.linalg.eigh(self.H_matrix)
+        eigvals_H = np.maximum(eigvals_H, 1e-12)
+        lengths = self.rho * np.sqrt(eigvals_H)
+        return lengths, eigvecs_H
 
     @property
     def lengths_rotation(self):
+        if not USE_CACHE:
+            return self._compute_lengths_rotation()
         if self._lengths_rotation is None:
-            eigvals_H, eigvecs_H = np.linalg.eigh(self.H_matrix)
-            eigvals_H = np.maximum(eigvals_H, 1e-12)
-            lengths = self.rho * np.sqrt(eigvals_H)
-            self._lengths_rotation = (lengths, eigvecs_H)
+            self._lengths_rotation = self._compute_lengths_rotation()
         return self._lengths_rotation
 
     @property
     def lengths(self) -> np.ndarray:
         return self.lengths_rotation[0]
 
-    @property
-    def rotation(self) -> np.ndarray:
-        return self.lengths_rotation[1]
+    def _compute_major_axis_endpoints(self):
+        if self.n_samples <= 1:
+            return self.center, self.center
+        center_distances = np.linalg.norm(self.data - self.center, axis=1)
+        p1 = self.data[np.argmin(center_distances)]
+        p2 = self.data[np.argmax(np.linalg.norm(self.data - p1, axis=1))]
+        p3 = self.data[np.argmax(np.linalg.norm(self.data - p2, axis=1))]
+        return p2, p3
 
     @property
     def major_axis_endpoints(self):
+        if not USE_CACHE:
+            return self._compute_major_axis_endpoints()
         if self._major_axis_endpoints is None:
-            if self.n_samples <= 1:
-                self._major_axis_endpoints = (self.center, self.center)
-            else:
-                center_distances = np.linalg.norm(self.data - self.center, axis=1)
-                p1 = self.data[np.argmin(center_distances)]
-                p2 = self.data[np.argmax(np.linalg.norm(self.data - p1, axis=1))]
-                p3 = self.data[np.argmax(np.linalg.norm(self.data - p2, axis=1))]
-                self._major_axis_endpoints = (p2, p3)
+            self._major_axis_endpoints = self._compute_major_axis_endpoints()
         return self._major_axis_endpoints
+
+    def _compute_density(self) -> float:
+        axes_sum = max(float(np.sum(self.lengths)), 1e-12)
+        mahal = np.sqrt(self.mahal_sq_points(self.data))
+        total_mahal = max(float(np.sum(mahal)), 1e-12)
+        return float((self.n_samples ** 2) / (axes_sum * total_mahal))
 
     @property
     def density(self) -> float:
+        if not USE_CACHE:
+            return self._compute_density()
         if self._density is None:
-            axes_sum = max(float(np.sum(self.lengths)), 1e-12)
-            mahal = np.sqrt(self.mahal_sq_points(self.data))
-            total_mahal = max(float(np.sum(mahal)), 1e-12)
-            self._density = float((self.n_samples ** 2) / (axes_sum * total_mahal))
+            self._density = self._compute_density()
         return self._density
 
 
@@ -170,33 +203,19 @@ def apply_data_scaler(data: np.ndarray, scaler_mode: str = "none") -> np.ndarray
 
 
 # ============================================================
-# GE generation: safe split + distance gate
+# GE generation: safe split + outlier split
 # ============================================================
-def split_distance_gate(parent: Ellipsoid, child1: Ellipsoid, child2: Ellipsoid) -> bool:
-    """
-    Distance gate for split quality.
-
-    This does not add a user parameter.
-    It prevents meaningless splits when two children are too close.
-    The threshold is inferred from the parent axis scale.
-    """
-    center_dist = float(np.linalg.norm(child1.center - child2.center))
-    parent_axis_mean = float(np.mean(parent.lengths)) if parent.lengths.size else 0.0
-
-    if parent_axis_mean <= 1e-12:
-        return True
-
-    # Internal conservative rule:
-    # if two child centers are extremely close compared with parent scale,
-    # keep parent to avoid noisy ellipsoids.
-    return center_dist >= 0.10 * parent_axis_mean
+def splits(ellipsoid_list: Sequence[Ellipsoid], num: int, epsilon: float) -> List[Ellipsoid]:
+    new_ells: List[Ellipsoid] = []
+    for ell in ellipsoid_list:
+        if ell.n_samples < num:
+            new_ells.append(ell)
+        else:
+            new_ells.extend(splits_ellipsoid(ell, epsilon=epsilon))
+    return new_ells
 
 
-def splits_ellipsoid(
-    ellipsoid: Ellipsoid,
-    epsilon: Optional[float] = None,
-    use_distance_gate: bool = True,
-) -> List[Ellipsoid]:
+def splits_ellipsoid(ellipsoid: Ellipsoid, epsilon: Optional[float] = None) -> List[Ellipsoid]:
     if ellipsoid.n_samples <= 1:
         return [ellipsoid]
 
@@ -225,34 +244,23 @@ def splits_ellipsoid(
     if np.sum(mask1) == 0 or np.sum(mask2) == 0:
         return [ellipsoid]
 
-    child1 = Ellipsoid(data[mask1], indices[mask1], epsilon=eps)
-    child2 = Ellipsoid(data[mask2], indices[mask2], epsilon=eps)
-
-    if use_distance_gate and not split_distance_gate(ellipsoid, child1, child2):
-        return [ellipsoid]
-
-    return [child1, child2]
+    return [
+        Ellipsoid(data[mask1], indices[mask1], epsilon=eps),
+        Ellipsoid(data[mask2], indices[mask2], epsilon=eps),
+    ]
 
 
-def splits(
-    ellipsoid_list: Sequence[Ellipsoid],
-    num: int,
-    epsilon: float,
-    use_distance_gate: bool = True,
-) -> List[Ellipsoid]:
-    new_ells: List[Ellipsoid] = []
-    for ell in ellipsoid_list:
-        if ell.n_samples < num:
-            new_ells.append(ell)
-        else:
-            new_ells.extend(
-                splits_ellipsoid(
-                    ell,
-                    epsilon=epsilon,
-                    use_distance_gate=use_distance_gate,
-                )
-            )
-    return new_ells
+def child_distance_gate_pass(parent: Ellipsoid, child_left: Ellipsoid, child_right: Ellipsoid) -> bool:
+    """
+    Distance gate for ablation.
+    It rejects a split if the two child ellipsoids are not sufficiently separated
+    in the parent Mahalanobis geometry. The threshold is derived from the parent
+    radius, so no new dataset-specific parameter is added.
+    """
+    diff = child_left.center - child_right.center
+    sep = float(np.sqrt(max(float(diff.T @ parent.solve_H(diff)), 0.0)))
+    threshold = 0.25 * max(float(parent.rho), 1e-12)
+    return sep >= threshold
 
 
 def recursive_split_outlier_detection(
@@ -261,7 +269,6 @@ def recursive_split_outlier_detection(
     t: float = 2.0,
     max_iterations: int = 10,
     epsilon: float = 1e-6,
-    use_distance_gate: bool = True,
 ) -> List[Ellipsoid]:
     ellipsoid_list = list(initial_ellipsoids)
 
@@ -281,21 +288,24 @@ def recursive_split_outlier_detection(
         min_leaf = max(2, int(np.ceil(np.sqrt(data.shape[0]) * 0.1)))
 
         for ell in outliers:
-            children = splits_ellipsoid(
-                ell,
-                epsilon=epsilon,
-                use_distance_gate=use_distance_gate,
-            )
-
+            children = splits_ellipsoid(ell, epsilon=epsilon)
             if len(children) != 2 or any(child.n_samples < min_leaf for child in children):
                 new_ells.append(ell)
                 continue
 
-            parent_density = ell.density
-            child_density_sum = sum(child.density for child in children)
+            # Quality gate: accept split only if child density improves enough.
+            quality_ok = True
+            if USE_QUALITY_GATE:
+                parent_density = ell.density
+                child_density_sum = sum(child.density for child in children)
+                quality_ok = child_density_sum > t * parent_density
 
-            # Original density improvement gate + added distance gate inside split.
-            if child_density_sum > t * parent_density:
+            # Distance gate: accept split only if two children are geometrically separated.
+            distance_ok = True
+            if USE_DISTANCE_GATE:
+                distance_ok = child_distance_gate_pass(ell, children[0], children[1])
+
+            if quality_ok and distance_ok:
                 new_ells.extend(children)
             else:
                 new_ells.append(ell)
@@ -304,15 +314,17 @@ def recursive_split_outlier_detection(
 
     return ellipsoid_list
 
-
 # ============================================================
 # DPC attributes
 # ============================================================
 def ellipse_mahalanobis_distance(ell_i: Ellipsoid, ell_j: Ellipsoid) -> float:
     avg_H = 0.5 * (ell_i.H_matrix + ell_j.H_matrix)
-    chol_avg = cho_factor(avg_H, lower=True, check_finite=False)
     diff = ell_i.center - ell_j.center
-    solved = cho_solve(chol_avg, diff, check_finite=False)
+    if USE_CHOLESKY:
+        chol_avg = cho_factor(avg_H, lower=True, check_finite=False)
+        solved = cho_solve(chol_avg, diff, check_finite=False)
+    else:
+        solved = np.linalg.pinv(avg_H) @ diff
     return float(np.sqrt(max(float(diff.T @ solved), 0.0)))
 
 
@@ -342,12 +354,11 @@ def ellipse_min_dist(dist_mat: np.ndarray, densities: np.ndarray):
 
     if n > 0:
         min_dists[order[0]] = np.max(min_dists)
-
     return min_dists, nearest
 
 
 # ============================================================
-# Center selection + distance pruning
+# Center selection
 # ============================================================
 def auto_select_centers_quality(
     densities: np.ndarray,
@@ -355,14 +366,6 @@ def auto_select_centers_quality(
     dist_mat: np.ndarray,
     top_k: int,
 ) -> List[int]:
-    """
-    Select centers by gamma = density * delta with distance pruning.
-
-    Improvement:
-    - avoid selecting centers that are too close to each other
-    - fallback to gamma order if pruning removes too many
-    - all thresholds are inferred from dist_mat, not exposed as user params
-    """
     n = len(densities)
     if n == 0:
         return []
@@ -379,10 +382,7 @@ def auto_select_centers_quality(
 
     median_dist = float(np.median(positive_dists))
     q25_dist = float(np.quantile(positive_dists, 0.25))
-
-    # Stronger than old 0.20 median, but still inferred.
-    # This reduces duplicated centers in the same region.
-    min_sep = max(q25_dist, 0.30 * median_dist, 1e-12)
+    min_sep = max(q25_dist, 0.20 * median_dist, 1e-12)
 
     selected: List[int] = []
     for idx in order:
@@ -393,11 +393,10 @@ def auto_select_centers_quality(
             nearest_selected_dist = float(np.min(dist_mat[idx, selected]))
             if nearest_selected_dist >= min_sep:
                 selected.append(idx)
-
         if len(selected) >= top_k:
             break
 
-    # Fallback if pruning is too strong.
+    # Fallback if pruning removes too many centers.
     if len(selected) < top_k:
         for idx in order:
             idx = int(idx)
@@ -434,6 +433,7 @@ def ellipse_cluster_single_chain(
         if labels[idx] == -1 and nearest[idx] != -1:
             labels[idx] = labels[nearest[idx]]
 
+    # Fallback for any unlabeled ellipsoid.
     for idx in np.where(labels == -1)[0]:
         c = centers[int(np.argmin(dist_mat[idx, centers]))]
         labels[idx] = labels[c]
@@ -454,15 +454,12 @@ def ellipse_cluster_conservative_graph_correction(
 
     positive = dist_mat[dist_mat > 0]
     eps_dist = float(np.median(positive) * 1e-9) if positive.size else 1e-12
-
-    # Internal values, not user parameters.
     k_neighbors = max(2, int(np.ceil(np.log2(max(n, 2)))))
     switch_margin = 1.75
 
     for idx in np.argsort(densities):
         if idx in center_set:
             continue
-
         higher = np.where(densities > densities[idx])[0]
         if higher.size == 0:
             continue
@@ -492,109 +489,36 @@ def ellipse_cluster_conservative_graph_correction(
 
 
 # ============================================================
-# Internal score and safety gates
+# Internal score and safety gate
 # ============================================================
-def cluster_distribution(labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    unique, counts = np.unique(labels, return_counts=True)
-    return unique, counts
+def cluster_size_ratio(labels: np.ndarray) -> float:
+    _, counts = np.unique(labels, return_counts=True)
+    return float(np.max(counts) / max(np.sum(counts), 1))
 
 
-def cluster_size_ratios(labels: np.ndarray) -> Tuple[float, float]:
-    _, counts = cluster_distribution(labels)
-    total = max(int(np.sum(counts)), 1)
-    largest_ratio = float(np.max(counts) / total)
-    smallest_ratio = float(np.min(counts) / total)
-    return largest_ratio, smallest_ratio
-
-
-def label_change_ratio(labels_a: np.ndarray, labels_b: np.ndarray) -> float:
-    if len(labels_a) == 0:
-        return 0.0
-    return float(np.mean(labels_a != labels_b))
-
-
-def is_distribution_acceptable(
-    labels: np.ndarray,
-    expected_k: int,
-    max_largest_ratio: Optional[float] = None,
-    min_smallest_ratio: Optional[float] = None,
-) -> bool:
-    """
-    Reject bad cluster distributions.
-
-    The thresholds are inferred based on expected_k:
-    - binary datasets can naturally be imbalanced, so allow larger largest cluster
-    - multi-class datasets should not be dominated by one cluster
-    """
-    labels = np.asarray(labels, dtype=int)
-    unique = np.unique(labels)
-
-    if len(unique) != int(expected_k):
+def is_graph_safe(single_labels: np.ndarray, graph_labels: np.ndarray, max_largest_ratio: float = 0.85) -> bool:
+    # Prevent one cluster from swallowing most ellipsoids.
+    if cluster_size_ratio(graph_labels) > max_largest_ratio:
         return False
 
-    largest, smallest = cluster_size_ratios(labels)
-
-    if max_largest_ratio is None:
-        max_largest_ratio = 0.92 if expected_k <= 2 else 0.65
-
-    if min_smallest_ratio is None:
-        min_smallest_ratio = 0.01 if expected_k <= 2 else 0.025
-
-    if largest > max_largest_ratio:
-        return False
-
-    if smallest < min_smallest_ratio:
+    # Prevent graph correction from changing too many ellipsoid labels.
+    changed_ratio = float(np.mean(single_labels != graph_labels))
+    if changed_ratio > 0.35:
         return False
 
     return True
 
 
-def is_graph_safe(
-    single_labels: np.ndarray,
-    graph_labels: np.ndarray,
-    expected_k: int,
-) -> bool:
-    """
-    Graph correction is used only if it is safe:
-    - it must not create severely imbalanced clusters
-    - it must not change too many labels from the stable single-chain backbone
-    """
-    if not is_distribution_acceptable(graph_labels, expected_k=expected_k):
-        return False
-
-    changed = label_change_ratio(single_labels, graph_labels)
-    if changed > 0.35:
-        return False
-
-    return True
-
-
-def internal_cluster_score(
-    labels: np.ndarray,
-    densities: np.ndarray,
-    dist_mat: np.ndarray,
-    expected_k: int,
-) -> float:
+def internal_cluster_score(labels: np.ndarray, densities: np.ndarray, dist_mat: np.ndarray) -> float:
     """
     Internal score, no ground-truth labels.
-
     Higher is better.
-    score = separation / compactness
-    with strong penalties for bad distribution.
 
-    Fixed version:
-    - compute sizes/largest_ratio/smallest_ratio before using them
-    - keep expected_k constraint
-    - use stronger imbalance penalty
+    score = separation / compactness, with penalties for cluster imbalance.
     """
     labels = np.asarray(labels, dtype=int)
     unique = sorted(np.unique(labels))
-
-    # Reject invalid number of clusters.
     if len(unique) <= 1:
-        return -1e18
-
-    if len(unique) != int(expected_k):
         return -1e18
 
     reps = []
@@ -603,9 +527,6 @@ def internal_cluster_score(
 
     for lab in unique:
         members = np.where(labels == lab)[0]
-        if members.size == 0:
-            continue
-
         sizes.append(len(members))
         rep = int(members[np.argmax(densities[members])])
         reps.append(rep)
@@ -613,25 +534,7 @@ def internal_cluster_score(
         if len(members) <= 1:
             compact_values.append(0.0)
         else:
-            sub = dist_mat[np.ix_(members, members)]
-            compact_values.append(float(np.mean(sub)))
-
-    if len(sizes) == 0:
-        return -1e18
-
-    sizes = np.asarray(sizes, dtype=float)
-    total_size = max(float(np.sum(sizes)), 1e-12)
-    largest_ratio = float(np.max(sizes) / total_size)
-    smallest_ratio = float(np.min(sizes) / total_size)
-
-    # Stronger distribution gate.
-    # Binary datasets can be naturally imbalanced, but not almost one-cluster.
-    if expected_k == 2:
-        if largest_ratio > 0.92 or smallest_ratio < 0.01:
-            return -1e18
-    else:
-        if largest_ratio > 0.65 or smallest_ratio < 0.025:
-            return -1e18
+            compact_values.append(float(np.mean(dist_mat[np.ix_(members, members)])))
 
     reps = np.asarray(reps, dtype=int)
     compactness = float(np.mean(compact_values)) + 1e-12
@@ -640,19 +543,19 @@ def internal_cluster_score(
     for i in range(len(reps)):
         for j in range(i + 1, len(reps)):
             sep_values.append(float(dist_mat[reps[i], reps[j]]))
-
     separation = float(np.mean(sep_values)) if sep_values else 0.0
 
-    # Stronger imbalance penalty than previous version.
-    imbalance = largest_ratio - (1.0 / expected_k)
-    imbalance_penalty = 1.0 / (1.0 + 8.0 * max(imbalance, 0.0))
+    sizes = np.asarray(sizes, dtype=float)
+    largest_ratio = float(np.max(sizes) / np.sum(sizes))
+    min_ratio = float(np.min(sizes) / np.sum(sizes))
 
-    # Avoid selecting singleton / tiny artificial clusters.
-    singleton_penalty = 1.0
-    if np.min(sizes) <= 1:
-        singleton_penalty = 0.10
+    imbalance_penalty = 1.0
+    if largest_ratio > 0.85:
+        imbalance_penalty *= 0.20
+    if min_ratio < 0.02:
+        imbalance_penalty *= 0.50
 
-    return (separation / compactness) * imbalance_penalty * singleton_penalty
+    return (separation / compactness) * imbalance_penalty
 
 
 def choose_best_labels_by_internal_score(
@@ -663,159 +566,36 @@ def choose_best_labels_by_internal_score(
     k_candidates: Sequence[int],
     allow_graph: bool = True,
 ):
-    """
-    Try k candidates and both label modes.
-    Select the best candidate by internal score.
-    """
     best = None
-    fallback = None
 
     for k in k_candidates:
-        k = int(k)
-        centers = auto_select_centers_quality(densities, min_dists, dist_mat, top_k=k)
-
+        centers = auto_select_centers_quality(densities, min_dists, dist_mat, top_k=int(k))
         single_labels = ellipse_cluster_single_chain(densities, centers, nearest, dist_mat)
-        single_score = internal_cluster_score(single_labels, densities, dist_mat, expected_k=k)
+        single_score = internal_cluster_score(single_labels, densities, dist_mat)
 
         candidates = [("single", single_labels, single_score)]
 
         if allow_graph:
-            graph_labels = ellipse_cluster_conservative_graph_correction(
-                densities=densities,
-                dist_mat=dist_mat,
-                centers=centers,
-                nearest=nearest,
-            )
-            if is_graph_safe(single_labels, graph_labels, expected_k=k):
-                graph_score = internal_cluster_score(graph_labels, densities, dist_mat, expected_k=k)
+            graph_labels = ellipse_cluster_conservative_graph_correction(densities, dist_mat, centers, nearest)
+            if is_graph_safe(single_labels, graph_labels):
+                graph_score = internal_cluster_score(graph_labels, densities, dist_mat)
                 candidates.append(("graph", graph_labels, graph_score))
 
         for mode, labels, score in candidates:
-            largest, smallest = cluster_size_ratios(labels)
-
             item = {
-                "k": k,
+                "k": int(k),
                 "mode": mode,
                 "centers": centers,
                 "labels": labels,
                 "score": float(score),
-                "largest_ratio": largest,
-                "smallest_ratio": smallest,
+                "largest_ratio": cluster_size_ratio(labels),
             }
-
-            # fallback stores best even if rejected, so the program never crashes.
-            raw_score = score
-            if fallback is None or raw_score > fallback["score"]:
-                fallback = item
-
-            if score <= -1e17:
-                continue
-
             if best is None or item["score"] > best["score"]:
                 best = item
 
     if best is None:
-        if fallback is None:
-            raise RuntimeError("No labeling candidate was found.")
-        print("[WARN] No candidate passed strict distribution gate. Using fallback best internal candidate.")
-        return fallback
-
+        raise RuntimeError("No valid labeling candidate was found.")
     return best
-
-
-
-# ============================================================
-# Lightweight final refinement
-# ============================================================
-def point_cluster_size_ratios(labels: np.ndarray) -> Tuple[float, float]:
-    """Return largest/smallest cluster ratios at point level."""
-    _, counts = np.unique(labels, return_counts=True)
-    total = max(int(np.sum(counts)), 1)
-    return float(np.max(counts) / total), float(np.min(counts) / total)
-
-
-def refine_labels_by_centroid(
-    data: np.ndarray,
-    labels: np.ndarray,
-    max_iter: int = 2,
-) -> np.ndarray:
-    """
-    Lightweight centroid-based refinement.
-
-    Purpose:
-    - correct wrong assignments after density propagation
-    - only uses predicted labels and feature data
-    - does NOT use ground-truth labels
-    - cost is low: O(n * k * max_iter)
-
-    This is used only when cluster distribution is too imbalanced.
-    """
-    X = np.asarray(data, dtype=float)
-    labels = np.asarray(labels, dtype=int).copy()
-    unique_labels = np.array(sorted(np.unique(labels)), dtype=int)
-
-    if unique_labels.size <= 1:
-        return labels
-
-    # Work with compact labels 0..k-1.
-    label_to_compact = {lab: i for i, lab in enumerate(unique_labels)}
-    compact_to_label = {i: lab for lab, i in label_to_compact.items()}
-    compact = np.array([label_to_compact[x] for x in labels], dtype=int)
-    k = unique_labels.size
-
-    for _ in range(max_iter):
-        centers = np.zeros((k, X.shape[1]), dtype=float)
-
-        for lab in range(k):
-            members = X[compact == lab]
-            if members.size == 0:
-                centers[lab] = 0.0
-            else:
-                centers[lab] = np.mean(members, axis=0)
-
-        # Squared Euclidean distance to centroids.
-        # Shape: n x k
-        dists = np.sum((X[:, None, :] - centers[None, :, :]) ** 2, axis=2)
-        new_compact = np.argmin(dists, axis=1).astype(int)
-
-        # Do not allow empty clusters. If empty appears, stop and keep previous labels.
-        if len(np.unique(new_compact)) < k:
-            break
-
-        if np.array_equal(new_compact, compact):
-            break
-
-        compact = new_compact
-
-    refined = np.array([compact_to_label[int(x)] for x in compact], dtype=int)
-    return refined
-
-
-def should_refine_point_labels(
-    labels: np.ndarray,
-    expected_k: int,
-    dataset_name: str = "custom",
-) -> bool:
-    """
-    Decide whether to apply centroid refinement.
-
-    Conservative rule:
-    - do not refine stable datasets where current GE-DPC result is already good
-    - refine only when point-level cluster distribution is clearly imbalanced
-    """
-    name = dataset_name.lower()
-
-    # These datasets are already stable in current results.
-    no_refine = {"iris", "seed", "rice", "rice_cammeo", "dry_bean"}
-    if name in no_refine:
-        return False
-
-    largest, smallest = point_cluster_size_ratios(labels)
-
-    if expected_k <= 2:
-        return largest > 0.85 or smallest < 0.05
-
-    return largest > 0.70 or smallest < 0.03
 
 
 # ============================================================
@@ -842,8 +622,8 @@ def print_distribution(name: str, labels: np.ndarray) -> None:
         print(f"  label {int(lab):>4}: {int(cnt)}")
 
 
- # ============================================================
-# Plotting only: clustering chart
+# ============================================================
+# Plotting
 # ============================================================
 def plot_predicted_clusters_2d(
     data: np.ndarray,
@@ -852,21 +632,13 @@ def plot_predicted_clusters_2d(
     show_legend: bool = False,
 ) -> None:
     """
-    Draw the final clustering result as a 2D scatter chart.
-
-    This function is visualization only. It does not change:
-    - ellipsoid generation
-    - density/delta/gamma computation
-    - center selection
-    - label propagation
-    - ACC/NMI/ARI evaluation
-    - runtime statistics, because it is called after evaluation timing
-
-    If the dataset has more than 2 dimensions, PCA is used only for plotting.
-    Axis names are intentionally hidden to match the paper-style charts.
+    Draw clustering result as a 2D scatter chart.
+    - If data has 2 dimensions: plot directly.
+    - If data has more than 2 dimensions: reduce to 2D using PCA.
+    This function is only for visualization and does not affect clustering results.
     """
     X = np.asarray(data, dtype=float)
-    y = np.asarray(pred_labels, dtype=int)
+    y = np.asarray(pred_labels)
 
     if X.ndim != 2:
         raise ValueError("Data must be a 2D array.")
@@ -874,32 +646,31 @@ def plot_predicted_clusters_2d(
     if X.shape[1] > 2:
         from sklearn.decomposition import PCA
         X_vis = PCA(n_components=2, random_state=42).fit_transform(X)
-    elif X.shape[1] == 2:
-        X_vis = X
+        xlabel = "PCA 1"
+        ylabel = "PCA 2"
     else:
-        X_vis = np.column_stack([X[:, 0], np.zeros(X.shape[0])])
+        X_vis = X
+        xlabel = "Feature 1"
+        ylabel = "Feature 2"
 
+    # Plot style similar to the example image
     plt.figure(figsize=(6.4, 4.8))
     unique_labels = np.unique(y)
 
     for lab in unique_labels:
-        mask = y == lab
+        mask = (y == lab)
         plt.scatter(
             X_vis[mask, 0],
             X_vis[mask, 1],
             s=16,
-            alpha=0.95,
-            label=f"Cluster {lab}",
+            alpha=0.95
         )
 
-    # Paper-style chart: no axis names.
-    plt.xlabel("")
-    plt.ylabel("")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
     plt.title(f"Clustering Result - {dataset_name}")
-
     if show_legend:
-        plt.legend(loc="best")
-
+        plt.legend([f"Cluster {lab}" for lab in unique_labels], loc="best")
     plt.tight_layout()
     plt.show()
 
@@ -910,14 +681,22 @@ def plot_predicted_clusters_2d(
 def get_adaptive_dataset_config(dataset_name: str) -> Dict[str, object]:
     """
     Dataset-level default configuration.
-
-    This config does not use ground-truth during clustering.
-    It only defines scaler, candidate k values, and whether graph correction
-    is allowed for each dataset.
+    This does not use ground-truth labels during clustering.
+    It only sets preprocessing and candidate k values for testing.
     """
     name = dataset_name.lower()
-
     configs = {
+        # "iris":        {"scaler": "none", "k_candidates": [3], "allow_graph": False},
+        # "seed":        {"scaler": "none", "k_candidates": [3], "allow_graph": False},
+        # "segment_3":   {"scaler": "none", "k_candidates": [8], "allow_graph": True},
+        # "landsat_2":   {"scaler": "none", "k_candidates": [5], "allow_graph": True},
+        # "msplice_2":   {"scaler": "none", "k_candidates": [4], "allow_graph": True},
+        # "rice":        {"scaler": "none", "k_candidates": [2], "allow_graph": False},
+        # "banknote":    {"scaler": "none", "k_candidates": [2], "allow_graph": False},
+        # "htru2":       {"scaler": "none", "k_candidates": [2], "allow_graph": False},
+        # "hcv_data":    {"scaler": "none", "k_candidates": [2], "allow_graph": False},
+        # "dry_bean":    {"scaler": "none", "k_candidates": [7], "allow_graph": True},
+        # "rice_cammeo": {"scaler": "none", "k_candidates": [2], "allow_graph": False},
         # Stable datasets: keep old behavior.
         "iris":        {"scaler": "none",     "k_candidates": [3],       "allow_graph": False, "distance_gate": True},
         "seed":        {"scaler": "none",     "k_candidates": [3],       "allow_graph": False, "distance_gate": True},
@@ -938,11 +717,7 @@ def get_adaptive_dataset_config(dataset_name: str) -> Dict[str, object]:
         # Multi-class larger dataset.
         "dry_bean":    {"scaler": "none",     "k_candidates": [7],       "allow_graph": True,  "distance_gate": True},
     }
-
-    return configs.get(
-        name,
-        {"scaler": "standard", "k_candidates": [2, 3], "allow_graph": True, "distance_gate": True},
-    )
+    return configs.get(name, {"scaler": "standard", "k_candidates": [2, 3], "allow_graph": True})
 
 
 def get_default_dataset_registry(base_dir: Path) -> Dict[str, Tuple[Path, Path]]:
@@ -1001,7 +776,7 @@ def get_default_dataset_registry(base_dir: Path) -> Dict[str, Tuple[Path, Path]]
 # ============================================================
 # Main pipeline
 # ============================================================
-def run_ge_dpc_adaptive_quality_gate(
+def run_ge_dpc_adaptive_quality(
     feature_file: Path,
     label_file: Path,
     dataset_name: str = "custom",
@@ -1010,75 +785,75 @@ def run_ge_dpc_adaptive_quality_gate(
     scaler_mode: Optional[str] = None,
     k_candidates: Optional[Sequence[int]] = None,
     allow_graph: Optional[bool] = None,
-    use_distance_gate: Optional[bool] = None,
-    show_chart: bool = False,
+    show_chart: bool = True,
+    variant_name: str = "Full AQG-GE-DPC",
+    use_quality_gate: bool = True,
+    use_distance_gate: bool = True,
+    use_cholesky: bool = True,
+    use_cache: bool = True,
 ) -> Dict[str, object]:
     data = np.loadtxt(feature_file, dtype=float)
     true_labels = np.loadtxt(label_file, dtype=float).astype(int)
 
     if data.ndim == 1:
         data = data.reshape(-1, 1)
-
     if len(data) != len(true_labels):
         raise ValueError(f"Data and label length mismatch: {len(data)} vs {len(true_labels)}")
 
     cfg = get_adaptive_dataset_config(dataset_name)
-
     if scaler_mode is None:
         scaler_mode = str(cfg["scaler"])
     if k_candidates is None:
         k_candidates = list(cfg["k_candidates"])
     if allow_graph is None:
         allow_graph = bool(cfg["allow_graph"])
-    if use_distance_gate is None:
-        use_distance_gate = bool(cfg.get("distance_gate", True))
+
+    set_ablation_switches(
+        use_quality_gate=use_quality_gate,
+        use_distance_gate=use_distance_gate,
+        use_cholesky=use_cholesky,
+        use_cache=use_cache,
+    )
 
     data = apply_data_scaler(data, scaler_mode=scaler_mode)
     num = int(np.ceil(np.sqrt(data.shape[0])))
 
-    print("=" * 96)
-    print("GE-DPC Adaptive Quality Gate Final Version")
-    print(f"Dataset       : {dataset_name}")
-    print(f"Data shape    : n={data.shape[0]}, d={data.shape[1]}")
-    print(f"Scaler mode   : {scaler_mode}")
-    print(f"k candidates  : {list(k_candidates)}")
-    print(f"Allow graph   : {allow_graph}")
-    print(f"Distance gate : {use_distance_gate}")
+    print("=" * 90)
+    print("GE-DPC Adaptive Quality Version")
+    print(f"Variant      : {variant_name}")
+    print(f"Dataset      : {dataset_name}")
+    print(f"Data shape   : n={data.shape[0]}, d={data.shape[1]}")
+    print(f"Scaler mode  : {scaler_mode}")
+    print(f"k candidates : {list(k_candidates)}")
+    print(f"Allow graph  : {allow_graph}")
+    print(f"Quality gate : {USE_QUALITY_GATE}")
+    print(f"Distance gate: {USE_DISTANCE_GATE}")
+    print(f"Cholesky     : {USE_CHOLESKY}")
+    print(f"Cache        : {USE_CACHE}")
     print(f"Safe split threshold num = ceil(sqrt(n)) = {num}")
-    print("=" * 96)
+    print("=" * 90)
 
     # 1) Generate granular ellipsoids
     t_gen_start = time.time()
-
-    ellipsoid_list: List[Ellipsoid] = [
-        Ellipsoid(data, np.arange(data.shape[0]), epsilon=epsilon)
-    ]
+    ellipsoid_list: List[Ellipsoid] = [Ellipsoid(data, np.arange(data.shape[0]), epsilon=epsilon)]
 
     iteration = 0
     while True:
         iteration += 1
         before = len(ellipsoid_list)
-        ellipsoid_list = splits(
-            ellipsoid_list,
-            num=num,
-            epsilon=epsilon,
-            use_distance_gate=use_distance_gate,
-        )
+        ellipsoid_list = splits(ellipsoid_list, num=num, epsilon=epsilon)
         after = len(ellipsoid_list)
         print(f"Ellipsoid count after safe split iteration {iteration}: {after}")
-
         if after == before:
             break
 
     ellipsoid_list = recursive_split_outlier_detection(
-        initial_ellipsoids=ellipsoid_list,
-        data=data,
+        ellipsoid_list,
+        data,
         t=outlier_t,
         max_iterations=10,
         epsilon=epsilon,
-        use_distance_gate=use_distance_gate,
     )
-
     print(f"Total ellipsoid count after outlier split: {len(ellipsoid_list)}")
     time_gen = time.time() - t_gen_start
 
@@ -1090,7 +865,7 @@ def run_ge_dpc_adaptive_quality_gate(
     gamma = densities * min_dists
     time_attr = time.time() - t_attr_start
 
-    # 3) Try k candidates and choose best label mode
+    # 3) Try multiple k and choose best by internal score
     t_cluster_start = time.time()
     best = choose_best_labels_by_internal_score(
         densities=densities,
@@ -1103,49 +878,32 @@ def run_ge_dpc_adaptive_quality_gate(
     ellipsoid_labels = best["labels"]
     time_cluster = time.time() - t_cluster_start
 
-    print("-" * 96)
+    print("-" * 90)
     print("Selected internal configuration")
-    print(f"Best k               : {best['k']}")
-    print(f"Best label mode      : {best['mode']}")
-    print(f"Internal score       : {best['score']:.6f}")
-    print(f"Largest cluster ratio: {best['largest_ratio']:.3f}")
-    print(f"Smallest cluster ratio: {best['smallest_ratio']:.3f}")
-    print(f"Selected centers     : {best['centers']}")
-    print(f"Selected gamma       : {[float(gamma[i]) for i in best['centers']]}")
+    print(f"Best k              : {best['k']}")
+    print(f"Best label mode     : {best['mode']}")
+    print(f"Internal score      : {best['score']:.6f}")
+    print(f"Largest cluster rate: {best['largest_ratio']:.3f}")
+    print(f"Selected centers    : {best['centers']}")
+    print(f"Selected gamma      : {[float(gamma[i]) for i in best['centers']]}")
     print_distribution("Ellipsoid cluster distribution:", ellipsoid_labels)
 
     # 4) Map ellipsoid labels back to data points
     pred_labels = np.full(len(data), -1, dtype=int)
-
     for i, ell in enumerate(ellipsoid_list):
         pred_labels[ell.indices] = ellipsoid_labels[i]
 
     if np.any(pred_labels == -1):
         raise RuntimeError("Some data points were not assigned a cluster label.")
 
-    print_distribution("Predicted data cluster distribution before refinement:", pred_labels)
-
-    # 5) Lightweight final refinement if point-level clusters are too imbalanced.
-    refined_applied = False
-    if should_refine_point_labels(pred_labels, expected_k=int(best["k"]), dataset_name=dataset_name):
-        pred_labels_refined = refine_labels_by_centroid(data, pred_labels, max_iter=2)
-        before_lrg, before_sml = point_cluster_size_ratios(pred_labels)
-        after_lrg, after_sml = point_cluster_size_ratios(pred_labels_refined)
-
-        # Keep refinement only if it improves distribution and keeps the same number of clusters.
-        if (
-            len(np.unique(pred_labels_refined)) == len(np.unique(pred_labels))
-            and after_lrg <= before_lrg
-            and after_sml >= before_sml
-        ):
-            pred_labels = pred_labels_refined
-            refined_applied = True
-
-    print(f"Final refinement applied: {refined_applied}")
-    print_distribution("Predicted data cluster distribution after refinement:", pred_labels)
+    print_distribution("Predicted data cluster distribution:", pred_labels)
     print_distribution("Ground-truth label distribution:", true_labels)
 
-    # 6) Final evaluation
+    # 5) Draw clustering chart (visualization only, does not affect logic)
+    if show_chart:
+        plot_predicted_clusters_2d(data, pred_labels, dataset_name=dataset_name, show_legend=False)
+
+    # 6) Evaluate by labels only after clustering is done
     aligned_pred = align_labels(true_labels, pred_labels)
     acc = accuracy_score(true_labels, aligned_pred)
     nmi = normalized_mutual_info_score(true_labels, pred_labels)
@@ -1153,30 +911,27 @@ def run_ge_dpc_adaptive_quality_gate(
 
     total_time = time_gen + time_attr + time_cluster
 
-    print("-" * 96)
+    print("-" * 90)
     print("Evaluation metrics")
     print(f"ACC: {acc:.3f}")
     print(f"NMI: {nmi:.3f}")
     print(f"ARI: {ari:.3f}")
-    print("-" * 96)
+    print("-" * 90)
     print("Runtime statistics")
     print(f"1. Ellipsoid generation time : {time_gen * 1000:.6f} ms")
     print(f"2. Attribute computation time: {time_attr * 1000:.6f} ms")
     print(f"3. Clustering selection time : {time_cluster * 1000:.6f} ms")
     print(f"Total program time           : {total_time * 1000:.6f} ms")
-    print("=" * 96)
-
-    # Visualization only: does not affect core algorithm or measured runtime.
-    if show_chart:
-        plot_predicted_clusters_2d(
-            data=data,
-            pred_labels=pred_labels,
-            dataset_name=dataset_name,
-            show_legend=False,
-        )
+    print("=" * 90)
 
     return {
         "dataset": dataset_name,
+        "variant": variant_name,
+        "use_quality_gate": USE_QUALITY_GATE,
+        "use_distance_gate": USE_DISTANCE_GATE,
+        "use_cholesky": USE_CHOLESKY,
+        "use_cache": USE_CACHE,
+        "allow_graph": allow_graph,
         "acc": acc,
         "nmi": nmi,
         "ari": ari,
@@ -1184,12 +939,9 @@ def run_ge_dpc_adaptive_quality_gate(
         "best_k": best["k"],
         "best_label_mode": best["mode"],
         "internal_score": best["score"],
-        "largest_cluster_ratio": best["largest_ratio"],
-        "smallest_cluster_ratio": best["smallest_ratio"],
         "selected_centers": best["centers"],
         "n_ellipsoids": len(ellipsoid_list),
         "n_clusters": len(np.unique(pred_labels)),
-        "refined_applied": refined_applied,
         "generation_time": time_gen,
         "attribute_time": time_attr,
         "cluster_time": time_cluster,
@@ -1207,17 +959,14 @@ def run_named_dataset(
     scaler_mode: Optional[str] = None,
     k_candidates: Optional[Sequence[int]] = None,
     allow_graph: Optional[bool] = None,
-    use_distance_gate: Optional[bool] = None,
-    show_chart: bool = False,
+    show_chart: bool = True,
 ) -> Dict[str, object]:
     registry = get_default_dataset_registry(base_dir)
     key = dataset_name.lower()
-
     if key not in registry:
         raise KeyError(f"Unknown dataset '{dataset_name}'. Available: {list(registry.keys())}")
 
     feature_file, label_file = registry[key]
-
     if not feature_file.exists() or not label_file.exists():
         raise FileNotFoundError(
             f"Dataset files not found for '{dataset_name}'.\n"
@@ -1225,7 +974,7 @@ def run_named_dataset(
             f"Label  : {label_file}"
         )
 
-    return run_ge_dpc_adaptive_quality_gate(
+    return run_ge_dpc_adaptive_quality(
         feature_file=feature_file,
         label_file=label_file,
         dataset_name=key,
@@ -1234,7 +983,6 @@ def run_named_dataset(
         scaler_mode=scaler_mode,
         k_candidates=k_candidates,
         allow_graph=allow_graph,
-        use_distance_gate=use_distance_gate,
         show_chart=show_chart,
     )
 
@@ -1246,6 +994,7 @@ def run_all_default_datasets(
     outlier_t: float = 2.0,
     show_chart: bool = False,
 ) -> Dict[str, Dict[str, object]]:
+    registry = get_default_dataset_registry(base_dir)
     if dataset_names is None:
         dataset_names = [
             "iris", "seed", "segment_3", "landsat_2",
@@ -1268,21 +1017,11 @@ def run_all_default_datasets(
             results[name] = {"error": str(exc)}
             print(f"[ERROR] {name}: {exc}")
 
-    print("\n" + "=" * 118)
+    print("\n" + "=" * 110)
     print("SUMMARY")
-    print("=" * 118)
-    print(
-        # f"{'Dataset':<18} {'ACC':>8} {'NMI':>8} {'ARI':>8} "
-        # f"{'Scaler':>10} {'Mode':>8} {'k':>4} {'Ells':>7} "
-        # f"{'Lrg':>7} {'Sml':>7} {'Refine':>8} {'Time(ms)':>12}"
-        # f"{'GE_Time(ms)':>14} {'Cluster(ms)':>14} {'Time(ms)':>12}"
-        f"{'Dataset':<18} {'ACC':>8} {'NMI':>8} {'ARI':>8} "
-        f"{'Scaler':>10} {'Mode':>8} {'k':>4} {'Ells':>7} "
-        f"{'Lrg':>7} {'Sml':>7} {'Refine':>8} "
-        f"{'GE_Time(ms)':>14} {'Cluster_Time(ms)':>18} {'Total_Time(ms)':>16}"
-    )
-    print("-" * 118)
-
+    print("=" * 110)
+    print(f"{'Dataset':<18} {'ACC':>8} {'NMI':>8} {'ARI':>8} {'Scaler':>10} {'Mode':>8} {'k':>4} {'Ells':>7} {'Time(ms)':>12}")
+    print("-" * 110)
     for name, res in results.items():
         if "error" in res:
             print(f"{name:<18} ERROR: {res['error']}")
@@ -1296,29 +1035,166 @@ def run_all_default_datasets(
                 f"{res['best_label_mode']:>8} "
                 f"{res['best_k']:>4} "
                 f"{res['n_ellipsoids']:>7} "
-                f"{res['largest_cluster_ratio']:>7.3f} "
-                f"{res['smallest_cluster_ratio']:>7.3f} "
-                f"{str(res.get('refined_applied', False)):>8} "
-                f"{res['generation_time'] * 1000:>14.6f} "
-                f"{res['cluster_time'] * 1000:>18.6f} "
-                f"{res['total_time'] * 1000:>16.6f}"
+                f"{res['total_time'] * 1000:>12.6f}"
             )
-
-    print("=" * 118)
+    print("=" * 110)
     return results
+
+
+# ============================================================
+# Ablation study runner
+# ============================================================
+def get_ablation_variants() -> List[Dict[str, object]]:
+    """
+    Incremental ablation variants for the table:
+    GE-DPC -> +Quality gate -> +Distance gate -> +Cholesky -> +Cache -> +Graph correction -> Full.
+    """
+    return [
+        {
+            "variant_name": "GE-DPC",
+            "use_quality_gate": False,
+            "use_distance_gate": False,
+            "use_cholesky": False,
+            "use_cache": False,
+            "force_allow_graph": False,
+        },
+        {
+            "variant_name": "+ Quality gate",
+            "use_quality_gate": True,
+            "use_distance_gate": False,
+            "use_cholesky": False,
+            "use_cache": False,
+            "force_allow_graph": False,
+        },
+        {
+            "variant_name": "+ Distance gate",
+            "use_quality_gate": True,
+            "use_distance_gate": True,
+            "use_cholesky": False,
+            "use_cache": False,
+            "force_allow_graph": False,
+        },
+        {
+            "variant_name": "+ Cholesky",
+            "use_quality_gate": True,
+            "use_distance_gate": True,
+            "use_cholesky": True,
+            "use_cache": False,
+            "force_allow_graph": False,
+        },
+        {
+            "variant_name": "+ Cache",
+            "use_quality_gate": True,
+            "use_distance_gate": True,
+            "use_cholesky": True,
+            "use_cache": True,
+            "force_allow_graph": False,
+        },
+        {
+            "variant_name": "+ Graph correction",
+            "use_quality_gate": True,
+            "use_distance_gate": True,
+            "use_cholesky": True,
+            "use_cache": True,
+            "force_allow_graph": True,
+        },
+        {
+            "variant_name": "Full AQG-GE-DPC",
+            "use_quality_gate": True,
+            "use_distance_gate": True,
+            "use_cholesky": True,
+            "use_cache": True,
+            "force_allow_graph": None,  # use dataset-level config
+        },
+    ]
+
+
+def run_ablation_study(
+    base_dir: Path,
+    dataset_names: Sequence[str],
+    epsilon: float = 1e-6,
+    outlier_t: float = 2.0,
+    show_chart: bool = False,
+) -> List[Dict[str, object]]:
+    registry = get_default_dataset_registry(base_dir)
+    all_results: List[Dict[str, object]] = []
+
+    for dataset_name in dataset_names:
+        key = dataset_name.lower()
+        if key not in registry:
+            print(f"[ERROR] Unknown dataset: {dataset_name}")
+            continue
+
+        feature_file, label_file = registry[key]
+        cfg = get_adaptive_dataset_config(key)
+
+        for var in get_ablation_variants():
+            try:
+                allow_graph = var["force_allow_graph"]
+                if allow_graph is None:
+                    allow_graph = bool(cfg["allow_graph"])
+
+                res = run_ge_dpc_adaptive_quality(
+                    feature_file=feature_file,
+                    label_file=label_file,
+                    dataset_name=key,
+                    epsilon=epsilon,
+                    outlier_t=outlier_t,
+                    scaler_mode=str(cfg["scaler"]),
+                    k_candidates=list(cfg["k_candidates"]),
+                    allow_graph=bool(allow_graph),
+                    show_chart=show_chart,
+                    variant_name=str(var["variant_name"]),
+                    use_quality_gate=bool(var["use_quality_gate"]),
+                    use_distance_gate=bool(var["use_distance_gate"]),
+                    use_cholesky=bool(var["use_cholesky"]),
+                    use_cache=bool(var["use_cache"]),
+                )
+                all_results.append(res)
+            except Exception as exc:
+                print(f"[ERROR] dataset={key}, variant={var['variant_name']}: {exc}")
+                all_results.append({
+                    "dataset": key,
+                    "variant": var["variant_name"],
+                    "error": str(exc),
+                })
+
+    print("\n" + "=" * 130)
+    print("ABLATION STUDY SUMMARY")
+    print("=" * 130)
+    print(f"{'Dataset':<16} {'Variant':<24} {'ACC':>8} {'NMI':>8} {'ARI':>8} {'Ells':>7} {'Time(ms)':>12} {'Mode':>8}")
+    print("-" * 130)
+    for res in all_results:
+        if "error" in res:
+            print(f"{res['dataset']:<16} {res['variant']:<24} ERROR: {res['error']}")
+        else:
+            print(
+                f"{res['dataset']:<16} "
+                f"{res['variant']:<24} "
+                f"{res['acc']:>8.3f} "
+                f"{res['nmi']:>8.3f} "
+                f"{res['ari']:>8.3f} "
+                f"{res['n_ellipsoids']:>7} "
+                f"{res['total_time'] * 1000:>12.6f} "
+                f"{res['best_label_mode']:>8}"
+            )
+    print("=" * 130)
+
+    return all_results
 
 
 if __name__ == "__main__":
     # If this file is inside GE-DPC-main/scripts, use parent.parent.
-    # If this file is directly inside GE-DPC-main, change to:
-    # BASE_DIR = Path(__file__).resolve().parent
+    # If this file is directly inside GE-DPC-main, change to Path(__file__).resolve().parent
     BASE_DIR = Path(__file__).resolve().parent.parent
 
     epsilon = 1e-6
     outlier_t = 2.0
 
-    # Run one dataset
-    # dataset_name = "msplice_2"
+    # =========================
+    # Run one dataset and show chart
+    # =========================
+    # dataset_name = "segment_3"
     # run_named_dataset(
     #     dataset_name=dataset_name,
     #     base_dir=BASE_DIR,
@@ -1327,17 +1203,32 @@ if __name__ == "__main__":
     #     show_chart=True,
     # )
 
-    # Run all datasets
-    dataset_names = [
-        "iris", "seed", "segment_3", "landsat_2",
-        "msplice_2", "rice", "banknote", "htru2",
-        "breast_cancer", "hcv_data", "dry_bean", "rice_cammeo",
-    ]
-
-    run_all_default_datasets(
+    # =========================
+    # Run ablation study on representative datasets
+    # Change this list to the datasets you want in Table ablation.
+    # Suggested: ["dry_bean", "htru2"] or ["seed", "dry_bean"]
+    # =========================
+    dataset_names = ["iris"]
+    run_ablation_study(
         base_dir=BASE_DIR,
         dataset_names=dataset_names,
         epsilon=epsilon,
         outlier_t=outlier_t,
-        show_chart=True,
+        show_chart=False,
     )
+
+    # =========================
+    # Optional: run all datasets with the full method
+    # =========================
+    # dataset_names = [
+    #     "iris", "seed", "segment_3", "landsat_2",
+    #     "msplice_2", "rice", "banknote", "htru2",
+    #     "breast_cancer", "hcv_data", "dry_bean", "rice_cammeo",
+    # ]
+    # run_all_default_datasets(
+    #     base_dir=BASE_DIR,
+    #     dataset_names=dataset_names,
+    #     epsilon=epsilon,
+    #     outlier_t=outlier_t,
+    #     show_chart=False,
+    # )

@@ -1108,37 +1108,37 @@ if __name__ == "__main__":
     # min_centers = auto_center_k
     # max_centers = auto_center_k
     # enable_light_merge = False
-    dataset_name = "hcv_data"
+    # dataset_name = "hcv_data"
 
-    auto_center_k = 2
-    min_centers = 2
-    max_centers = 2
-    enable_light_merge = False
+    # auto_center_k = 2
+    # min_centers = 2
+    # max_centers = 2
+    # enable_light_merge = False
 
-    run_named_dataset(
-        dataset_name=dataset_name,
-        base_dir=BASE_DIR,
-        epsilon=epsilon,
-        outlier_t=outlier_t,
-        auto_center_k=auto_center_k,
-        min_centers=min_centers,
-        max_centers=max_centers,
-        enable_light_merge=enable_light_merge,
-    )
+    # run_named_dataset(
+    #     dataset_name=dataset_name,
+    #     base_dir=BASE_DIR,
+    #     epsilon=epsilon,
+    #     outlier_t=outlier_t,
+    #     auto_center_k=auto_center_k,
+    #     min_centers=min_centers,
+    #     max_centers=max_centers,
+    #     enable_light_merge=enable_light_merge,
+    # )
 
     # ========================================================
     # Neu muon chay 8 dataset hay dung, bo comment doan duoi.
     # use_dataset_default_k=True se dung k theo tung dataset.
     # ========================================================
-    # dataset_names = [
-    #     "iris", "seed", "segment_3", "landsat_2",
-    #     "msplice_2", "rice", "banknote", "htru2",
-    # ]
-    # all_results = run_all_default_datasets(
-    #     base_dir=BASE_DIR,
-    #     dataset_names=dataset_names,
-    #     epsilon=epsilon,
-    #     outlier_t=outlier_t,
-    #     use_dataset_default_k=True,
-    #     enable_light_merge=False,
-    # )
+    dataset_names = [
+        "iris", "seed", "segment_3", "landsat_2",
+        "msplice_2", "rice", "banknote", "htru2",
+    ]
+    all_results = run_all_default_datasets(
+        base_dir=BASE_DIR,
+        dataset_names=dataset_names,
+        epsilon=epsilon,
+        outlier_t=outlier_t,
+        use_dataset_default_k=True,
+        enable_light_merge=False,
+    )
