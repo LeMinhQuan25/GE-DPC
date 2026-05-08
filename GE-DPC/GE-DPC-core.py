@@ -448,8 +448,8 @@ if __name__ == '__main__':
     # feature_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone.txt'
     # label_file = BASE_DIR / 'data' / 'miniboone' / 'miniboone_label.txt'
 
-    # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
-    # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
+    feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Iris.txt'
+    label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Iris_label.txt'
     # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'Seed.txt'
     # label_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets_label' / 'Seed_label.txt'
     # feature_file = BASE_DIR / 'real_dataset_and_label' / 'real_datasets' / 'segment_3.txt'
@@ -469,8 +469,8 @@ if __name__ == '__main__':
     # label_file = BASE_DIR / 'dataset' / 'label' / 'hcv_data_label.txt'
     # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'dry_bean.txt'
     # label_file = BASE_DIR / 'dataset' / 'label' / 'dry_bean_label.txt'
-    feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
-    label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
+    # feature_file = BASE_DIR / 'dataset' / 'unlabel' / 'rice+cammeo.txt'
+    # label_file = BASE_DIR / 'dataset' / 'label' / 'rice+cammeo_label.txt'
 
     # =========================
     # Algorithm settings

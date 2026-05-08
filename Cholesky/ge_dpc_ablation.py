@@ -1208,7 +1208,7 @@ if __name__ == "__main__":
     # Change this list to the datasets you want in Table ablation.
     # Suggested: ["dry_bean", "htru2"] or ["seed", "dry_bean"]
     # =========================
-    dataset_names = ["iris"]
+    dataset_names = ["iris","rice_cammeo"]
     run_ablation_study(
         base_dir=BASE_DIR,
         dataset_names=dataset_names,

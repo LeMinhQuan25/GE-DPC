@@ -604,8 +604,10 @@ def plot_predicted_clusters_2d(
             edgecolors="none"
         )
 
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
+    # plt.xlabel(xlabel)
+    # plt.ylabel(ylabel)
+    plt.xlabel("")
+    plt.ylabel("")
     title = f"Clustering Result - {dataset_name}"
     if title_suffix:
         title += f" ({title_suffix})"
@@ -1055,24 +1057,45 @@ def run_parameter_sensitivity_analysis(
     default_scaler = str(cfg.get("scaler", "none"))
     default_allow_graph = bool(cfg.get("allow_graph", False))
 
+    # experiments = [
+    #     ("Quality threshold", "0.90", {"outlier_t": 0.90}),
+    #     ("Quality threshold", "1.00", {"outlier_t": 1.00}),
+    #     ("Quality threshold", "1.50", {"outlier_t": 1.50}),
+    #     ("Quality threshold", "2.00", {"outlier_t": 2.00}),
+
+    #     (r"$\tau_{sep}$", "0.80", {"tau_sep_scale": 0.80}),
+    #     (r"$\tau_{sep}$", "1.00", {"tau_sep_scale": 1.00}),
+    #     (r"$\tau_{sep}$", "1.20", {"tau_sep_scale": 1.20}),
+    #     (r"$\tau_{sep}$", "1.40", {"tau_sep_scale": 1.40}),
+
+    #     ("Splitting threshold", r"$0.8\sqrt{n}$", {"splitting_threshold_scale": 0.80}),
+    #     ("Splitting threshold", r"$\sqrt{n}$", {"splitting_threshold_scale": 1.00}),
+    #     ("Splitting threshold", r"$1.2\sqrt{n}$", {"splitting_threshold_scale": 1.20}),
+
+    #     ("Graph correction ratio", "0.10", {"graph_change_ratio": 0.10, "allow_graph": True}),
+    #     ("Graph correction ratio", "0.20", {"graph_change_ratio": 0.20, "allow_graph": True}),
+    #     ("Graph correction ratio", "0.30", {"graph_change_ratio": 0.30, "allow_graph": True}),
+    #     ("Graph correction ratio", "0.40", {"graph_change_ratio": 0.40, "allow_graph": True}),
+    # ]
     experiments = [
         ("Quality threshold", "0.90", {"outlier_t": 0.90}),
         ("Quality threshold", "1.00", {"outlier_t": 1.00}),
         ("Quality threshold", "1.50", {"outlier_t": 1.50}),
-        ("Quality threshold", "2.00", {"outlier_t": 2.00}),
+        ("Quality threshold", "2.00 (default)", {"outlier_t": 2.00}),
 
         (r"$\tau_{sep}$", "0.80", {"tau_sep_scale": 0.80}),
-        (r"$\tau_{sep}$", "1.00", {"tau_sep_scale": 1.00}),
+        (r"$\tau_{sep}$", "1.00 (default)", {"tau_sep_scale": 1.00}),
         (r"$\tau_{sep}$", "1.20", {"tau_sep_scale": 1.20}),
         (r"$\tau_{sep}$", "1.40", {"tau_sep_scale": 1.40}),
 
         ("Splitting threshold", r"$0.8\sqrt{n}$", {"splitting_threshold_scale": 0.80}),
-        ("Splitting threshold", r"$\sqrt{n}$", {"splitting_threshold_scale": 1.00}),
+        ("Splitting threshold", r"$\sqrt{n}$ (default)", {"splitting_threshold_scale": 1.00}),
         ("Splitting threshold", r"$1.2\sqrt{n}$", {"splitting_threshold_scale": 1.20}),
 
         ("Graph correction ratio", "0.10", {"graph_change_ratio": 0.10, "allow_graph": True}),
         ("Graph correction ratio", "0.20", {"graph_change_ratio": 0.20, "allow_graph": True}),
         ("Graph correction ratio", "0.30", {"graph_change_ratio": 0.30, "allow_graph": True}),
+        ("Graph correction ratio", "0.35 (default)", {"graph_change_ratio": 0.35, "allow_graph": True}),
         ("Graph correction ratio", "0.40", {"graph_change_ratio": 0.40, "allow_graph": True}),
     ]
 
@@ -1185,7 +1208,7 @@ if __name__ == "__main__":
     # =========================
     run_parameter_sensitivity_analysis(
         base_dir=BASE_DIR,
-        dataset_name="htru2",
+        dataset_name="segment_3",
         repeats=10,
         epsilon=epsilon,
         save_figures=True,
