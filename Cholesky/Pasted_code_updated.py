@@ -872,12 +872,8 @@ def plot_predicted_clusters_2d(
     if X.shape[1] > 2:
         from sklearn.decomposition import PCA
         X_vis = PCA(n_components=2, random_state=42).fit_transform(X)
-        xlabel = "PC 1"
-        ylabel = "PC 2"
     else:
         X_vis = X
-        xlabel = "Feature 1"
-        ylabel = "Feature 2"
 
     plt.figure(figsize=(6.4, 4.8))
     unique_labels = np.unique(y)
@@ -892,9 +888,9 @@ def plot_predicted_clusters_2d(
             label=f"Cluster {lab}",
         )
 
-    # plt.xlabel(xlabel)
-    # plt.ylabel(ylabel)
-    plt.title(f"Clustering Result - {dataset_name}")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.title(dataset_name)
 
     if show_legend:
         plt.legend(loc="best")
