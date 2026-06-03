@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 # =========================
 datasets = [
     "Iris", "Seeds", "Segment", "Landsat", "Msplice", "Rice",
-    "Banknote", "Htru2", "Breast Cancer", "HCV", "Dry Bean", "Rice C&O"
+    "Banknote", "HTRU2", "Breast Cancer", "HCV", "Dry Bean", "Rice C&O"
 ]
 
 methods = {
@@ -21,13 +21,13 @@ methods = {
     ]) / 1000,
 
     "GE-DPC": np.array([
-        13.1, 12.0, 84.0, 94.0, 173.0, 222.0,
+        10.0, 12.0, 84.0, 94.0, 173.0, 222.0,
         67.0, 1003.0, 85.0, 57.0, 848.0, 174.0
     ]) / 1000,
 
     "AQD-GE-DPC": np.array([
-        4.8, 10.7, 65.2, 64.6, 82.3, 112.3,
-        44.2, 443.8, 35.2, 34.7, 394.4, 94.5
+        5.3, 7.4, 69.9, 57.0, 164.6, 193.0,
+        46.0, 399.6, 44.6, 26.9, 783.1, 192.3
     ]) / 1000,
 }
 
@@ -46,12 +46,14 @@ width = 0.18
 y_cap = 1.2   # giới hạn trục Y để nhìn rõ time nhỏ
 
 fig, ax = plt.subplots(figsize=(16, 7))
+fig.patch.set_facecolor("white")
+ax.set_facecolor("white")
 
 # =========================
 # DRAW BARS
 # =========================
 for i, (method, values) in enumerate(methods.items()):
-    offset = (i - 1.5) * width
+    offset = (i - (len(methods) - 1) / 2) * width
 
     # Cắt chiều cao cột ở mức y_cap, nhưng vẫn ghi số thật
     plot_values = np.minimum(values, y_cap)
@@ -88,7 +90,7 @@ for i, (method, values) in enumerate(methods.items()):
         )
 
 # =========================
-# STYLE giống chart ACC
+# STYLE
 # =========================
 ax.set_title("Runtime", fontsize=20, fontweight="bold", pad=18)
 ax.set_ylabel("Runtime (s)", fontsize=15)
