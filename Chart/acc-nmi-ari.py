@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 # =========================
 datasets = [
     "Iris", "Seeds", "Segment", "Landsat", "Msplice", "Rice",
-    "Banknote", "HTRU2", "Breast Cancer", "HCV", "Dry Bean", "Rice C&O"
+    "Banknote", "HTRU2", "Breast Cancer", "HCV", "Dry Bean", "Rice C/O"
 ]
 
 acc = {
@@ -81,21 +81,21 @@ def plot_chart(data, title, ylabel, ymin=0.0, ymax=1.10, label_from_zero=False):
                 ha="center",
                 va="bottom",
                 color="black",
-                fontsize=8,
+                fontsize=14,
                 rotation=90,
                 clip_on=False
             )
 
-    ax.set_title(title, fontsize=18, color="black", pad=15, fontweight="bold")
-    ax.set_ylabel(ylabel, fontsize=14, color="black")
+    ax.set_title(title, fontsize=30, color="black", pad=15, fontweight="bold")
+    ax.set_ylabel(ylabel, fontsize=20, color="black")
     ax.set_ylim(ymin, ymax)
 
     # Vẽ đường trục 0, đặc biệt cần cho ARI có giá trị âm
     ax.axhline(0, color="black", linewidth=0.8)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(datasets, rotation=28, ha="right", color="black")
-    ax.tick_params(axis="y", colors="black")
+    ax.set_xticklabels(datasets, rotation=28, ha="right", color="black", fontsize=16)
+    ax.tick_params(axis="y", colors="black", labelsize=16)
 
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.set_axisbelow(True)
@@ -108,7 +108,7 @@ def plot_chart(data, title, ylabel, ymin=0.0, ymax=1.10, label_from_zero=False):
         bbox_to_anchor=(0.5, -0.16),
         ncol=4,
         frameon=False,
-        fontsize=11
+        fontsize=18
     )
 
     plt.tight_layout()

@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 # =========================
 datasets = [
     "Iris", "Seeds", "Segment", "Landsat", "Msplice", "Rice",
-    "Banknote", "HTRU2", "Breast Cancer", "HCV", "Dry Bean", "Rice C&O"
+    "Banknote", "HTRU2", "Breast Cancer", "HCV", "Dry Bean", "Rice C/O"
 ]
 
 methods = {
@@ -83,7 +83,7 @@ for i, (method, values) in enumerate(methods.items()):
             f"{v:.3f}",
             ha="center",
             va="bottom",
-            fontsize=8.5,
+            fontsize=14,
             rotation=90,
             color="#333333",
             clip_on=False
@@ -92,14 +92,15 @@ for i, (method, values) in enumerate(methods.items()):
 # =========================
 # STYLE
 # =========================
-ax.set_title("Runtime", fontsize=20, fontweight="bold", pad=18)
-ax.set_ylabel("Runtime (s)", fontsize=15)
+ax.set_title("Runtime", fontsize=30, fontweight="bold", pad=18)
+ax.set_ylabel("Runtime (s)", fontsize=20)
 
 ax.set_xticks(x)
-ax.set_xticklabels(datasets, rotation=25, ha="right", fontsize=11)
+ax.set_xticklabels(datasets, rotation=20, ha="right", fontsize=16)
 
 ax.set_ylim(0, 1.35)
 ax.set_yticks(np.arange(0, 1.31, 0.2))
+ax.tick_params(axis="y", labelsize=16)
 
 ax.grid(axis="y", linestyle="--", alpha=0.35)
 ax.set_axisbelow(True)
@@ -112,7 +113,7 @@ ax.legend(
     bbox_to_anchor=(0.5, -0.22),
     ncol=4,
     frameon=False,
-    fontsize=12
+    fontsize=15
 )
 
 plt.tight_layout()
